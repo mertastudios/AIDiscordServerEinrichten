@@ -1,0 +1,117 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  CI für AIDiscordServerEinrichten
+#
+#  ⚠️ Diese Datei liegt bewusst in ci/ und NICHT in .github/workflows/.
+#     Der Deploy-Bot hat keine 'workflows'-Berechtigung; GitHub lehnt den
+#     Push sonst komplett ab. Aktivieren mit:
+#
+#         mkdir -p .github/workflows && git mv ci/ci.yml .github/workflows/ci.yml
+#
+#     Details: ci/README.md
+#
+#  Läuft bei jedem Push und jedem Pull Request. Kein Discord-Token nötig:
+#  Der Smoke-Test startet den echten Web-Server gegen einen simulierten
+#  Discord-Client (scripts/_fake_discord.py) und fährt 198 Prüfungen,
+#  inklusive der vollständigen Ausführung aller fünf Setup-Vorlagen.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke-test:
+    name: Smoke-Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Python ${{ matrix.python-version }} einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Abhängigkeiten installieren
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax prüfen (compileall)
+        run: python -m compileall -q bot scripts
+
+      - name: Smoke-Test ausführen
+        env:
+          # Reiner Platzhalter — der Test verbindet sich nicht mit Discord.
+          DISCORD_BOT_TOKEN: ci.placeholder.token
+          LOG_LEVEL: WARNING
+          PUBLIC_URL: https://ci.example.com
+        run: python scripts/smoke_test.py
+
+      - name: Start ohne Token muss sauber fehlschlagen
+        run: |
+          set +e
+          output=$(env -u DISCORD_BOT_TOKEN python -m bot 2>&1)
+          code=$?
+          set -e
+          echo "$output"
+          test "$code" = "2" || { echo "Erwartet Exit-Code 2 bei fehlendem Token, bekam $code"; exit 1; }
+          echo "$output" | grep -q "DISCORD_BOT_TOKEN fehlt" \
+            || { echo "Klare Fehlermeldung fehlt"; exit 1; }
+
+  image:
+    name: Docker-Image bauen
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Image bauen (ohne Push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: aidiscordservereinrichten:ci
+
+      - name: Container startet und antwortet auf /api/health
+        run: |
+          docker run -d --name relay-ci \
+            -e DISCORD_BOT_TOKEN=ci.placeholder.token \
+            -e PORT=8080 \
+            -p 8080:8080 \
+            aidiscordservereinrichten:ci
+
+          # Der Healthcheck muss antworten, auch wenn der Bot mangels gültigem
+          # Token nie mit Discord verbunden ist — genau dafür ist er da.
+          ok=""
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/api/health > /tmp/health.json 2>/dev/null; then
+              ok=1; break
+            fi
+            sleep 1
+          done
+          cat /tmp/health.json || true
+          docker logs relay-ci | tail -40
+          test -n "$ok" || { echo "/api/health hat nicht geantwortet"; exit 1; }
+          grep -q '"status":"healthy"' /tmp/health.json \
+            || { echo "Health-Antwort unerwartet"; exit 1; }
+          docker rm -f relay-ci

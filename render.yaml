@@ -1,0 +1,62 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Render Blueprint — "Deploy to Render" für AIDiscordServerEinrichten
+#
+#  Nutzung:
+#    1. Repo auf GitHub pushen
+#    2. Render Dashboard → "New +" → "Blueprint"
+#    3. Dieses Repo auswählen → Render findet diese Datei automatisch
+#    4. Im Wizard DISCORD_BOT_TOKEN eintragen → "Apply"
+#
+#  Alternativ manuell: New + → Web Service → Runtime "Docker" →
+#  Health Check Path: /api/health
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  - type: web
+    name: aidiscordservereinrichten
+    runtime: docker
+    plan: free
+    region: frankfurt
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: ./
+    healthCheckPath: /api/health
+    # WICHTIG: genau 1 Instanz. Session-Tokens leben im Speicher/lokalen Daten-
+    # verzeichnis der Instanz. Mehr Instanzen ⇒ Token würde zufällig unbekannt sein.
+    numInstances: 1
+    autoDeploy: true
+    envVars:
+      # ── Pflicht ────────────────────────────────────────────────────────────
+      - key: DISCORD_BOT_TOKEN
+        sync: false          # wirst du beim Deploy im Render-Dashboard gefragt
+
+      # ── Optional (sinnvolle Defaults sind im Code hinterlegt) ──────────────
+      - key: LOG_LEVEL
+        value: INFO
+      - key: SESSION_TTL_HOURS
+        value: "24"
+      - key: MAX_SESSIONS_PER_GUILD
+        value: "5"
+      - key: API_RATE_LIMIT
+        value: "240"
+      - key: API_RATE_WINDOW
+        value: "60"
+      - key: ALLOWED_ORIGIN
+        value: "*"
+      - key: CONSOLE_ENABLED
+        value: "true"
+      # Braucht "SERVER MEMBERS INTENT" im Developer Portal. Ist der Schalter
+      # aus, startet der Bot automatisch ohne ihn weiter und bleibt online.
+      - key: PRIVILEGED_INTENTS
+        value: "true"
+      # PUBLIC_URL leer lassen → Render liefert RENDER_EXTERNAL_URL automatisch.
+      # Nur setzen, falls du eine eigene Domain davor schaltest.
+      - key: PUBLIC_URL
+        value: ""
+
+# ── Für bezahlte Pläne: persistente Disk, damit Sessions einen Deploy überleben
+#    (einfach die Kommentarzeichen entfernen)
+#    disk:
+#      name: relay-data
+#      sizeGB: 1
+#      mountPath: /app/data

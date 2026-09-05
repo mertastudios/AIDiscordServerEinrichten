@@ -1,0 +1,54 @@
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# ── Virtuelle Umgebungen ──────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Tooling-Caches ────────────────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# ── Laufzeitdaten des Bots (Session-Tokens!) ──────────────────────────────
+data/
+*.sqlite
+*.sqlite3
+*.db
+sessions.json
+
+# ── Geheimnisse / lokale Konfiguration ────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.token
+token.txt
+secrets.json
+config.local.py
+
+# ── Editor / OS ───────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Logs ──────────────────────────────────────────────────────────────────
+*.log
+logs/
