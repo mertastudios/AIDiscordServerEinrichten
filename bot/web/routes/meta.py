@@ -73,6 +73,14 @@ async def health(ctx: Ctx) -> Dict[str, Any]:
         "service": __botname__,
         "version": __version__,
         "bot": "connected" if connected else "connecting",
+        # Detailstatus des Discord-Logins (connecting|online|rate_limited|
+        # waiting|invalid_token|connection_refused|closed). Bei rate_limited
+        # läuft gerade die automatische Abkühlphase nach einem 429/Cloudflare-
+        # Bann — discord_retry_at sagt, wann der nächste Versuch startet.
+        # Einfach laufen lassen, NICHT neu deployen (das verlängert den Bann)!
+        "discord_status": getattr(state, "discord_status", "connecting"),
+        "discord_last_error": getattr(state, "discord_last_error", None),
+        "discord_retry_at": getattr(state, "discord_retry_at", None),
         "bot_user": user.name if user else None,
         "bot_id": sf(user.id) if user else None,
         "guilds": len(client.guilds) if client is not None else 0,

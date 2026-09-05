@@ -155,12 +155,26 @@ class RelayClient(discord.Client):
         # Persistente Button-View registrieren (URL-Button ist dekorativ,
         # die Custom-ID-Buttons brauchen den Handler).
         self.add_view(RelayButtons(self, f"{self.state.base_url()}/console"))
-        await self.tree.sync()
-        log.info("Slash-Commands global registriert (Sync kann bis zu 1 Stunde dauern; "
-                 "auf bestehenden Servern meist sofort).")
+        try:
+            await self.tree.sync()
+        except discord.HTTPException as exc:
+            # Ein fehlgeschlagener Sync (z. B. 429/Cloudflare-Bann) darf den Bot
+            # NICHT in einen Reconnect-Loop zwingen: Global registrierte Commands
+            # bleiben serverseitig aktiv, der Sync wird beim nächsten (Re-)Connect
+            # automatisch wiederholt. Der Bot läuft also weiter statt neu zu loggen
+            # (jeder neue Login würde einen laufenden Bann nur verlängern).
+            log.warning("Slash-Command-Sync fehlgeschlagen (%s) — Bot läuft weiter, "
+                        "bereits registrierte Commands bleiben aktiv.", exc)
+        else:
+            log.info("Slash-Commands global registriert (Sync kann bis zu 1 Stunde dauern; "
+                     "auf bestehenden Servern meist sofort).")
 
     async def on_ready(self) -> None:
         self.ready_at = now_utc()
+        # Login geglückt → Health-Status zurück auf „online“, alte Fehlermeldung weg.
+        self.state.discord_status = "online"
+        self.state.discord_last_error = None
+        self.state.discord_retry_at = None
         user = self.user
         guild_names = ", ".join(g.name for g in self.guilds[:8]) or "(keine)"
         log.info("═" * 68)

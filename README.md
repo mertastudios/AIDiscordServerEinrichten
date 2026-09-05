@@ -501,9 +501,26 @@ versuchen; sonst `/connect` neu ausführen.
 Token fehlt, ist abgelaufen oder wurde widerrufen. `/connect` erneut ausführen.
 Jede dieser Antworten enthält einen `hint` mit genau dieser Anleitung.
 
+**Bot bleibt offline: `429 Too Many Requests` / Cloudflare `Error 1015`**
+Die IP ist bei Discord vorübergehend gesperrt (*„You are being rate
+limited"*). Der Bot erkennt das, wartet automatisch immer länger (mind. 60 s,
+danach exponentiell bis 10 Minuten) und verbindet sich von selbst neu —
+**einfach laufen lassen und NICHT ständig „Redeploy"/„Restart" drücken**
+(jeder Neustart setzt die Wartezeit zurück und kann den Bann verlängern).
+Im Render-Log steht, wann der nächste Versuch startet; `GET /api/health`
+zeigt zusätzlich `discord_status`, `discord_last_error` und `discord_retry_at`.
+Typische Ursachen: geteilte Render-IP im Free-Plan, derselbe Token in zwei
+Prozessen gleichzeitig (z. B. lokal **und** auf Render — einen davon stoppen!),
+doppelte Render-Instanzen (`numInstances` muss `1` sein) oder viele Restarts
+kurz hintereinander. Dauert der Bann länger als ~1 Stunde: doppelte Prozesse
+stoppen, Token im Developer Portal zurücksetzen (falls er irgendwo doppelt
+läuft) und ggf. auf einen bezahlten Plan mit eigener ausgehender IP wechseln.
+
 **Bot startet nicht: `LoginFailure`**
 `DISCORD_BOT_TOKEN` ist ungültig. Im Developer Portal **Reset Token**, neues
-Token in Render unter *Environment* eintragen, **Save Changes**.
+Token in Render unter *Environment* eintragen, **Save Changes**. Der Prozess
+bleibt dabei bewusst am Leben (grünes `/api/health`) und versucht den Login
+alle 5 Minuten erneut — kein Crash-Loop, kein Login-Spam.
 
 **Bot startet nicht: `PrivilegedIntentsRequired`**
 Der Bot startet automatisch ohne privilegierte Intents neu und bleibt online.

@@ -43,6 +43,14 @@ class AppState:
         self.client = client
         self.config = config
         self.store = store
+        # Discord-Verbindungsstatus für /api/health. Wird vom Login-Loop
+        # (bot.main) und on_ready gepflegt — damit man bei „Bot offline"
+        # sofort sieht, OB gewartet wird und WANN es weitergeht, statt zu raten:
+        # connecting | online | rate_limited | waiting | invalid_token |
+        # connection_refused | closed
+        self.discord_status: str = "connecting"
+        self.discord_last_error: Optional[str] = None
+        self.discord_retry_at: Optional[str] = None
         self.started_at = time.monotonic()
         self.started_wall = now_utc()
         self.request_count = 0
