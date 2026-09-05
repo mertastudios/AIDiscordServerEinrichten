@@ -11,8 +11,10 @@
 #
 #  Läuft bei jedem Push und jedem Pull Request. Kein Discord-Token nötig:
 #  Der Smoke-Test startet den echten Web-Server gegen einen simulierten
-#  Discord-Client (scripts/_fake_discord.py) und fährt 198 Prüfungen,
+#  Discord-Client (scripts/_fake_discord.py) und fährt 199 Prüfungen,
 #  inklusive der vollständigen Ausführung aller fünf Setup-Vorlagen.
+#  Dazu kommt scripts/login_recovery_test.py (72 Prüfungen) für das Verhalten
+#  bei 429 / Cloudflare Error 1015 — mit Fake-Uhr, also ohne Netzwerk.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: CI
@@ -65,6 +67,19 @@ jobs:
           LOG_LEVEL: WARNING
           PUBLIC_URL: https://ci.example.com
         run: python scripts/smoke_test.py
+
+      - name: Login-Wiederherstellung testen (429 / Cloudflare Error 1015)
+        env:
+          DISCORD_BOT_TOKEN: ci.placeholder.token
+          LOG_LEVEL: CRITICAL
+          PUBLIC_URL: https://ci.example.com
+        run: python scripts/login_recovery_test.py
+
+      - name: Netz-Diagnose läuft eigenständig (informativ)
+        # Braucht ausgehenden Netzverkehr; ein Blocker ist das nicht, deshalb
+        # darf dieser Schritt fehlschlagen, ohne den Job rot zu machen.
+        continue-on-error: true
+        run: python -m bot.netcheck
 
       - name: Start ohne Token muss sauber fehlschlagen
         run: |

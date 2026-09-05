@@ -49,6 +49,25 @@ services:
       # aus, startet der Bot automatisch ohne ihn weiter und bleibt online.
       - key: PRIVILEGED_INTENTS
         value: "true"
+
+      # ── Cloudflare-Sperre der ausgehenden IP (429 / Error 1015) ────────────
+      # Renders Ausgangs-IPs sind GETEILTE CIDR-Bereiche: Flutet ein anderer
+      # Mieter Discord, blockt Cloudflare die IP für alle. Der Bot misst das
+      # mit einem tokenlosen Aufruf, probt alle 30 s und loggt sich sofort ein,
+      # wenn die Sperre fällt. Bleibt sie 10 min bestehen, beendet er sich mit
+      # Exit-Code 3 → Render startet einen frischen Container → neue IP-Chance.
+      # Diagnose: GET /api/diagnostics  ·  Abschalten: RESTART_ON_IP_BAN=false
+      - key: BAN_PROBE_INTERVAL_SECONDS
+        value: "30"
+      - key: BAN_WATCH_SECONDS
+        value: "600"
+      - key: RESTART_ON_IP_BAN
+        value: "true"
+      # Dauerhafte Lösung: eigener HTTP-Proxy mit statischer IP (REST + Gateway).
+      # Leer lassen = direkte Verbindung. Wird im Deploy-Wizard abgefragt,
+      # weil die URL Zugangsdaten enthalten kann.
+      - key: DISCORD_PROXY
+        sync: false
       # PUBLIC_URL leer lassen → Render liefert RENDER_EXTERNAL_URL automatisch.
       # Nur setzen, falls du eine eigene Domain davor schaltest.
       - key: PUBLIC_URL

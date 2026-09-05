@@ -51,6 +51,16 @@ class AppState:
         self.discord_status: str = "connecting"
         self.discord_last_error: Optional[str] = None
         self.discord_retry_at: Optional[str] = None
+        # Netzwerk-Diagnose (bot.netcheck): ausgehende IP + Erreichbarkeit von
+        # discord.com. Beantwortet die Frage „Bot kaputt oder IP gesperrt?".
+        self.net_report: Optional[Any] = None
+        self.net_checked_mono: float = 0.0
+        self.login_attempts: int = 0
+        self.login_failures: int = 0
+        self.ban_watches: int = 0
+        self.restart_requested: Optional[str] = None
+        self.commands_synced_at: Optional[Any] = None
+        self._net_ready: Optional[asyncio.Event] = None
         self.started_at = time.monotonic()
         self.started_wall = now_utc()
         self.request_count = 0
@@ -66,6 +76,44 @@ class AppState:
 
     def now_iso(self) -> str:
         return iso(now_utc()) or ""
+
+    # ── Netzwerk-Diagnose ────────────────────────────────────────────────────
+    def net_ready(self) -> asyncio.Event:
+        """
+        Event, das gesetzt wird, sobald die erste Netz-Diagnose vorliegt.
+
+        Wird bewusst *lazy* erzeugt: ``AppState`` entsteht auch in Tests ohne
+        laufenden Event-Loop.
+        """
+        if self._net_ready is None:
+            self._net_ready = asyncio.Event()
+        return self._net_ready
+
+    def set_net_report(self, report: Any) -> None:
+        """Hinterlegt ein :class:`bot.netcheck.NetReport` und weckt Wartende."""
+        self.net_report = report
+        self.net_checked_mono = time.monotonic()
+        self.net_ready().set()
+
+    def net_report_age(self) -> float:
+        """Alter der letzten Diagnose in Sekunden (``inf``, wenn es keine gibt)."""
+        return float("inf") if not self.net_checked_mono else max(
+            0.0, time.monotonic() - self.net_checked_mono
+        )
+
+    @property
+    def egress_ip(self) -> Optional[str]:
+        return getattr(self.net_report, "egress_ip", None)
+
+    def net_dict(self) -> Dict[str, Any]:
+        """JSON-fähige Ansicht der letzten Diagnose (für /api/health)."""
+        report = self.net_report
+        if report is None:
+            return {"verdict": "not_checked"}
+        try:
+            return report.to_dict()
+        except Exception:  # noqa: BLE001 — Diagnose darf nie eine Antwort killen
+            return {"verdict": getattr(report, "verdict", "unknown")}
 
     # ── Öffentliche Basis-URL ────────────────────────────────────────────────
     def base_url(self) -> str:

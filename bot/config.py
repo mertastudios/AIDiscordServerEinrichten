@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-__all__ = ("Config", "load_config", "ConfigError")
+__all__ = ("Config", "load_config", "ConfigError", "mask_proxy_url")
 
 _TRUE = {"1", "true", "yes", "y", "on", "ja", "enable", "enabled"}
 _FALSE = {"0", "false", "no", "n", "off", "nein", "disable", "disabled"}
@@ -71,6 +71,19 @@ def _clean_url(url: str) -> str:
     return url
 
 
+def mask_proxy_url(url: str) -> str:
+    """
+    Zugangsdaten aus einer Proxy-URL entfernen (``user:pass@`` → ``user:***@``).
+
+    Die Konfiguration wird beim Start ins Log geschrieben — ein Log-Screenshot
+    darf keine Proxy-Passwörter enthalten.
+    """
+    return re.sub(r"^(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)(?P<user>[^:/@]+)(?::(?P<pw>[^@]*))?@",
+                  lambda m: f"{m.group('scheme')}{m.group('user')}"
+                            f"{':***' if m.group('pw') else ''}@",
+                  url.strip())
+
+
 @dataclass(slots=True)
 class Config:
     # ── Discord ────────────────────────────────────────────────────────────
@@ -115,6 +128,47 @@ class Config:
     """
     login_retry_max_seconds: float = 600.0
     """Obergrenze eines einzelnen Wartezyklus nach fehlgeschlagenem Login."""
+    netcheck_timeout_seconds: float = 8.0
+    """Zeitgrenze für die Netzwerk-Diagnose (ausgehende IP + Discord-Probe)."""
+    ban_probe_interval_seconds: float = 30.0
+    """
+    Abstand der **unauthentifizierten** Discord-Probe während einer IP-Sperre.
+
+    30 s = 2 Proben pro Minute = 20 in 10 Minuten. Discords IP-Limit liegt bei
+    10.000 ungültigen Anfragen pro 10 Minuten — die Überwachung kostet also
+    0,2 % des Budgets, erkennt eine aufgehobene Sperre aber ~60× schneller als
+    ein blinder 30-Minuten-Schlaf.
+    """
+    ban_watch_seconds: float = 600.0
+    """
+    Wie lange die IP beobachtet wird, bevor der Container neu gestartet wird.
+
+    Bleibt die ausgehende IP so lange gesperrt, ist sie faktisch dauerhaft
+    verbrannt (typisch: ein anderer Mieter auf derselben Render-IP flutet
+    Discord). Ein Neustart gibt dem Container eine neue Adresse aus Renders
+    geteiltem Ausgangs-Bereich — oft die einzige Möglichkeit, wieder online zu
+    kommen. ``0`` deaktiviert den Neustart (dann wird unbegrenzt weiter probiert).
+    """
+    restart_on_ip_ban: bool = True
+    """
+    ``True`` ⇒ Prozess beenden, wenn die IP dauerhaft von Cloudflare gesperrt
+    bleibt, damit Render einen frischen Container (neue ausgehende IP) startet.
+    """
+    restart_delay_seconds: float = 30.0
+    """Wartezeit vor dem bewussten Neustart — Zeit für einen sauberen Shutdown."""
+    discord_proxy: str = ""
+    """
+    HTTP(S)-Proxy für **alle** Discord-Verbindungen (REST *und* Gateway),
+    z. B. ``http://user:pass@proxy.example.com:3128``.
+
+    Dauerhafte Lösung bei gesperrten/geteilten Cloud-IPs: Der Traffic verlässt
+    das Rechenzentrum über eine eigene, saubere IP. Leer lassen = direkte
+    Verbindung.
+    """
+    discord_proxy_user: str = ""
+    """Benutzername für den Proxy (falls nicht schon in der URL enthalten)."""
+    discord_proxy_password: str = ""
+    """Passwort für den Proxy (falls nicht schon in der URL enthalten)."""
     fatal_retry_seconds: float = 300.0
     """
     Wartezeit nach *fatalen* Login-Fehlern (ungültiger Token, dauerhaft vom
@@ -143,7 +197,7 @@ class Config:
         Weitere bleibt lesbar. So ist eine Fehlkonfiguration im Render-Log
         erkennbar, ohne dass ein Log-Screenshot das Token preisgibt.
         """
-        secret_fields = {"discord_token"}
+        secret_fields = {"discord_token", "discord_proxy_password"}
         values: Dict[str, Any] = {}
         for name in sorted(dir(self)):
             if name.startswith("_"):
@@ -155,7 +209,14 @@ class Config:
             if callable(value):
                 continue
             if name in secret_fields and isinstance(value, str) and value:
-                values[name] = f"{value[:6]}…{value[-4:]} ({len(value)} Zeichen)"
+                # Kurze Werte würden bei „vorne 6 + hinten 4" fast vollständig
+                # im Log landen — dann lieber ganz schwärzen.
+                values[name] = (
+                    f"{value[:6]}…{value[-4:]} ({len(value)} Zeichen)"
+                    if len(value) > 16 else f"*** ({len(value)} Zeichen)"
+                )
+            elif name == "discord_proxy" and isinstance(value, str) and value:
+                values[name] = mask_proxy_url(value)
             else:
                 values[name] = value
         return values
@@ -236,6 +297,14 @@ def load_config() -> Config:
         login_retry_base_seconds=_float("LOGIN_RETRY_BASE_SECONDS", 15.0),
         login_retry_max_seconds=_float("LOGIN_RETRY_MAX_SECONDS", 600.0),
         fatal_retry_seconds=_float("FATAL_RETRY_SECONDS", 300.0),
+        netcheck_timeout_seconds=_float("NETCHECK_TIMEOUT_SECONDS", 8.0),
+        ban_probe_interval_seconds=_float("BAN_PROBE_INTERVAL_SECONDS", 30.0),
+        ban_watch_seconds=_float("BAN_WATCH_SECONDS", 600.0),
+        restart_on_ip_ban=_bool("RESTART_ON_IP_BAN", True),
+        restart_delay_seconds=_float("RESTART_DELAY_SECONDS", 30.0),
+        discord_proxy=_str("DISCORD_PROXY", ""),
+        discord_proxy_user=_str("DISCORD_PROXY_USER", ""),
+        discord_proxy_password=_str("DISCORD_PROXY_PASSWORD", ""),
     )
 
     if cfg.session_ttl_hours < 0:
@@ -252,6 +321,21 @@ def load_config() -> Config:
         raise ConfigError("LOGIN_RETRY_MAX_SECONDS darf höchstens 3600 sein.")
     if cfg.fatal_retry_seconds <= 0:
         raise ConfigError("FATAL_RETRY_SECONDS muss größer als 0 sein.")
+    if not 2.0 <= cfg.netcheck_timeout_seconds <= 30.0:
+        raise ConfigError("NETCHECK_TIMEOUT_SECONDS muss zwischen 2 und 30 liegen.")
+    if not 5.0 <= cfg.ban_probe_interval_seconds <= 600.0:
+        raise ConfigError("BAN_PROBE_INTERVAL_SECONDS muss zwischen 5 und 600 liegen.")
+    if cfg.ban_watch_seconds < 0 or cfg.ban_watch_seconds > 7200:
+        raise ConfigError("BAN_WATCH_SECONDS muss zwischen 0 und 7200 liegen "
+                          "(0 = unbegrenzt probieren, kein Neustart).")
+    if cfg.restart_delay_seconds < 0 or cfg.restart_delay_seconds > 600:
+        raise ConfigError("RESTART_DELAY_SECONDS muss zwischen 0 und 600 liegen.")
+    if cfg.discord_proxy and not re.match(r"^https?://", cfg.discord_proxy):
+        raise ConfigError(
+            f"DISCORD_PROXY muss mit http:// oder https:// beginnen (Wert: "
+            f"{mask_proxy_url(cfg.discord_proxy)!r}). SOCKS-Proxys werden von "
+            "aiohttp ohne Zusatzpaket nicht unterstützt."
+        )
     if cfg.log_level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
         cfg.log_level = "INFO"
 
