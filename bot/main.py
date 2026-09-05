@@ -11,7 +11,10 @@ Ablauf
    ``/api/health`` und UptimeRobot kann den Dienst wach halten.
 6. Bot mit Discord verbinden. Klappt das wegen nicht freigeschalteter
    **privilegierter Intents** nicht, wird automatisch ohne sie neu gestartet —
-   der Bot bleibt also online, statt im Crash-Loop zu hängen.
+   der Bot bleibt also online, statt im Crash-Loop zu hängen. Schlägt der
+   Login wegen eines **Rate-Limits / Cloudflare-Banns (429/1015)** fehl, wartet
+   der Bot exponentiell länger (statt Discord zu fluten) und verbindet sich
+   von selbst neu.
 7. Auf ``SIGTERM``/``SIGINT`` warten (Render schickt das bei jedem Deploy) und
    sauber herunterfahren.
 """
@@ -22,9 +25,11 @@ import asyncio
 import contextlib
 import logging
 import os
+import random
 import signal
 import sys
 import time
+from datetime import timedelta
 from typing import Any, Optional
 
 import discord
@@ -33,6 +38,7 @@ from . import __botname__, __version__
 from .config import Config, ConfigError, load_config
 from .discord_bot import RelayClient, build_intents
 from .sessions import SessionStore
+from .util import iso, now_utc
 from .web.app import AppState, build_app, start_web_server, stop_web_server
 
 log = logging.getLogger("relay.main")
@@ -127,18 +133,137 @@ async def _housekeeping(state: AppState, stop: asyncio.Event) -> None:
             )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Login-Wiederholung mit Backoff (Schutz vor 429 / Cloudflare Error 1015)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Hintergrund: Schlägt ``client.start()`` beim Login fehl, weil Cloudflare die
+# IP vorübergehend sperrt (Error 1015 → discord.py wirft sofort
+# ``HTTPException: 429``, ganz ohne internen Wiederholungsversuch), dann
+# verlängert JEDE weitere Anfrage während des Banns den Bann. Ein sturer
+# „alle 10 Sekunden neu versuchen“-Loop hält den Bot deshalb *dauerhaft*
+# offline — er flutet sich selbst in die Sperre. Genau das verhindern die
+# Helfer unten: exponentiell wachsende Wartezeiten mit Zufalls-Jitter,
+# Respekt vor dem ``Retry-After``-Header des Servers und eine echte
+# Abkühlphase (mind. 60 s) nach jedem 429er.
+#
+# Zweite Lektion: Fatale Fehler (falscher Token, dauerhaft abgewiesene
+# Verbindung) beenden den Prozess bewusst NICHT mehr. Ein Exit würde Render
+# sofort neu starten lassen (Crash-Loop) — also Login-Spam, der ebenfalls in
+# einem Cloudflare-Bann endet. Stattdessen bleiben Web-Server und /api/health
+# erreichbar und der Login wird in großem Abstand erneut versucht.
+
+#: Mindestwartezeit nach einem Cloudflare-Bann (Error 1015), egal beim wievielten Versuch.
+CLOUDFLARE_MIN_WAIT = 60.0
+#: Mindestwartezeit nach einem normalen Discord-Rate-Limit (429 mit Via-Header).
+DISCORD_RATELIMIT_MIN_WAIT = 30.0
+#: Harte Obergrenze für einen einzelnen Wartezyklus (schützt vor absurd großen
+#: Retry-After-Werten und unbeabsichtigtem Dauer-Schlaf).
+MAX_SINGLE_WAIT = 1800.0
+#: Verjährung: Liegt der letzte Fehlversuch länger zurück, gilt der nächste
+#: Ausfall wieder als Einzelfall und wird schnell neu versucht (statt mit der
+#: über Stunden aufgebauten Maximalwartezeit).
+BACKOFF_RESET_AFTER = 300.0
+
+
+def _extract_retry_after(exc: BaseException) -> Optional[float]:
+    """
+    Liest einen vom Server gewünschten Wartewert aus einer Discord-Exception.
+
+    Quellen: ``RateLimited.retry_after`` bzw. der ``Retry-After``-Header der
+    HTTP-Antwort (Cloudflare/Discord). Liefert ``None``, wenn nichts dabei ist.
+    """
+    direct = getattr(exc, "retry_after", None)
+    if isinstance(direct, (int, float)) and direct >= 0:
+        return float(direct)
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers:
+        try:
+            raw = headers.get("Retry-After")
+        except Exception:  # noqa: BLE001 — fremdes Header-Objekt, defensiv
+            raw = None
+        if raw:
+            try:
+                return max(0.0, float(str(raw).strip()))
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _is_cloudflare_ban(exc: discord.HTTPException) -> bool:
+    """
+    True, wenn der 429er von Cloudflare (z. B. Error 1015) statt von Discord kommt.
+
+    discord.py wirft genau dann sofort (ohne internen Retry), wenn der
+    429-Antwort der ``Via``-Header fehlt oder der Body kein JSON ist — beides
+    ist bei einer Cloudflare-Fehlerseite der Fall. (Der ``error code: 0`` allein
+    taugt NICHT als Kriterium: Auch echte Discord-429-JSONs enthalten oft kein
+    ``code``-Feld. Entscheidend ist der fehlende ``Via``-Header.)
+    """
+    if getattr(exc, "status", 0) != 429:
+        return False
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return True  # nichts inspizierbar → vorsichtig wie einen Bann behandeln
+    try:
+        return not bool(headers.get("Via"))
+    except Exception:  # noqa: BLE001 — defensiv: im Zweifel wie ein Bann behandeln
+        return True
+
+
+def _backoff_delay(base: float, cap: float, failures: int) -> float:
+    """
+    Exponentielles Backoff mit Equal-Jitter: ``base * 2^(n-1)``, gedeckelt auf
+    ``cap``, plus Zufall (Hälfte fest, Hälfte zufällig). Der Jitter verhindert,
+    dass mehrere gleichzeitig gestartete Instanzen im Gleichtakt loshämmern.
+    """
+    exp = min(cap, base * (2.0 ** max(0, failures - 1)))
+    return exp / 2.0 + random.uniform(0, exp / 2.0)
+
+
 async def _connect_bot(
     config: Config, store: SessionStore, state: AppState, stop: asyncio.Event
 ) -> None:
     """
     Verbindet den Bot mit Discord — mit automatischem Fallback auf
-    nicht-privilegierte Intents.
+    nicht-privilegierte Intents und Backoff bei Rate-Limits.
 
-    Ohne diesen Fallback würde ein vergessener Schalter im Developer Portal
+    Ohne den Intent-Fallback würde ein vergessener Schalter im Developer Portal
     (``SERVER MEMBERS INTENT``) zu einem endlosen Crash-Loop auf Render führen.
+    Ohne das Backoff würde ein 429/Cloudflare-Bann durch sture Wiederholung
+    endlos verlängert — der Bot käme nie wieder online.
     """
     privileged = config.enable_privileged_intents
     attempt = 0
+    failures = 0
+    last_failure = 0.0
+
+    def note_failure() -> int:
+        """Zählt einen Fehlversuch (mit Verjährung alter Ausfälle)."""
+        nonlocal failures, last_failure
+        now = time.monotonic()
+        if now - last_failure > BACKOFF_RESET_AFTER:
+            failures = 0
+        failures += 1
+        last_failure = now
+        return failures
+
+    def backoff() -> float:
+        """Nächste Wartezeit aus Basis, Maximum und Fehlerzähler."""
+        return _backoff_delay(
+            config.login_retry_base_seconds,
+            config.login_retry_max_seconds,
+            note_failure(),
+        )
+
+    async def wait_and_report(delay: float, status: str, error: str) -> None:
+        """Wartet (abbrechenbar) und spiegelt Grund + nächsten Versuch ins Health-API."""
+        state.discord_status = status
+        state.discord_last_error = error[:300]
+        state.discord_retry_at = iso(now_utc() + timedelta(seconds=max(0.0, delay)))
+        await _sleep_or_stop(stop, delay)
 
     while not stop.is_set():
         attempt += 1
@@ -159,6 +284,8 @@ async def _connect_bot(
             client = RelayClient(config, store, state, intents=intents)
             state.client = client
 
+        state.discord_status = "connecting"
+        state.discord_retry_at = None
         log.info("Verbinde Bot mit Discord (%s) …",
                  "mit privilegierten Intents" if privileged else "ohne privilegierte Intents")
         try:
@@ -176,37 +303,126 @@ async def _connect_bot(
                 )
                 privileged = False
                 continue
-            log.critical("Privilegierte Intents wurden verweigert — Abbruch.")
-            raise
+            # Sollte eigentlich nie passieren (ohne privilegierte Intents gibt es
+            # nichts zu verweigern) — aber falls doch: kein Crash-Loop, sondern
+            # in großem Abstand neu versuchen, Web-Server bleibt erreichbar.
+            log.critical(
+                "❌ Discord verweigert die Intents sogar ohne privilegierte Scopes. "
+                "Neuer Versuch alle %.0f s — bitte Token und Developer-Portal prüfen.",
+                config.fatal_retry_seconds,
+            )
+            await wait_and_report(
+                config.fatal_retry_seconds, "connection_refused",
+                "PrivilegedIntentsRequired trotz deaktivierter privilegierter Intents",
+            )
+            continue
         except discord.LoginFailure as exc:
+            with contextlib.suppress(Exception):
+                await client.close()
+            # BEWUSST kein raise: Ein Exit würde Render sofort neu starten lassen
+            # (Crash-Loop = Login-Spam = Cloudflare-Bann). Stattdessen bleibt der
+            # Prozess mit grünem /api/health am Leben und versucht es später neu.
             log.critical(
                 "❌ Login fehlgeschlagen: %s\n"
                 "   DISCORD_BOT_TOKEN ist ungültig.\n"
                 "   → https://discord.com/developers/applications → App → Bot → 'Reset Token'\n"
-                "   → neues Token in Render unter Environment setzen → Save Changes.",
-                exc,
+                "   → neues Token in Render unter Environment setzen → Save Changes.\n"
+                "   Der Web-Server bleibt erreichbar, der Login wird alle %.0f s erneut versucht.",
+                exc, config.fatal_retry_seconds,
             )
-            raise
+            await wait_and_report(
+                config.fatal_retry_seconds, "invalid_token",
+                f"LoginFailure: {exc}",
+            )
+            continue
+        except discord.HTTPException as exc:
+            with contextlib.suppress(Exception):
+                await client.close()
+            status = getattr(exc, "status", 0)
+            retry_after = _extract_retry_after(exc)
+            delay = backoff()
+            if status == 429:
+                # 429 beim Login = der kritische Fall: Jede weitere Anfrage kann
+                # den Bann verlängern → echte Abkühlphase, kein Schnellschuss.
+                floor = CLOUDFLARE_MIN_WAIT if _is_cloudflare_ban(exc) else DISCORD_RATELIMIT_MIN_WAIT
+                delay = max(delay, floor)
+            if retry_after is not None:
+                delay = max(delay, retry_after + 5.0)
+            delay = min(delay, MAX_SINGLE_WAIT)
+            if status == 429 and _is_cloudflare_ban(exc):
+                log.error(
+                    "❌ Discord-Login rate-limitiert (HTTP 429, Cloudflare-Bann/Error 1015). "
+                    "Die IP ist vorübergehend gesperrt — jeder weitere Versuch in dieser Zeit "
+                    "würde den Bann VERLÄNGERN. Der Bot wartet jetzt automatisch %.0f s "
+                    "(Fehlversuch %d in Folge) und verbindet sich dann neu. Bitte in dieser "
+                    "Zeit NICHT manuell neu deployen/starten — das setzt die Wartezeit zurück! "
+                    "Typische Ursachen: geteilte Render-IP (Free-Plan), derselbe Token in zwei "
+                    "Prozessen (z. B. lokal + Render gleichzeitig) oder viele Restarts kurz "
+                    "hintereinander.",
+                    delay, failures,
+                )
+            elif status == 429:
+                log.error(
+                    "❌ Discord-Rate-Limit beim Login (HTTP 429). Neuer Versuch in %.0f s "
+                    "(Fehlversuch %d in Folge).",
+                    delay, failures,
+                )
+            else:
+                log.error(
+                    "❌ Discord meldete HTTP %s beim Login (%s). Neuer Versuch in %.0f s "
+                    "(Fehlversuch %d in Folge).",
+                    status, exc, delay, failures,
+                )
+            await wait_and_report(
+                delay, "rate_limited" if status == 429 else "waiting",
+                f"HTTP {status} beim Login: {exc}"[:300],
+            )
+            continue
+        except discord.RateLimited as exc:
+            with contextlib.suppress(Exception):
+                await client.close()
+            retry_after = _extract_retry_after(exc) or 0.0
+            delay = min(max(backoff(), retry_after + 5.0), MAX_SINGLE_WAIT)
+            log.error(
+                "❌ Discord-Rate-Limit beim Login (Retry in %.0f s). Neuer Versuch in %.0f s.",
+                retry_after, delay,
+            )
+            await wait_and_report(
+                delay, "rate_limited",
+                f"RateLimited: Retry in {retry_after:.0f} s",
+            )
+            continue
         except discord.GatewayNotFound:
             with contextlib.suppress(Exception):
                 await client.close()
-            log.error("Discord-Gateway nicht erreichbar — neuer Versuch in 15 s.")
-            await _sleep_or_stop(stop, 15)
+            delay = backoff()
+            log.error("Discord-Gateway nicht erreichbar — neuer Versuch in %.0f s.", delay)
+            await wait_and_report(delay, "waiting", "GatewayNotFound: Gateway nicht erreichbar")
             continue
         except discord.ConnectionClosed as exc:
             with contextlib.suppress(Exception):
                 await client.close()
             if getattr(exc, "code", None) in {4004, 4010, 4011, 4012, 4013, 4014}:
+                # BEWUSST kein raise (siehe LoginFailure): kein Crash-Loop.
                 log.critical(
                     "❌ Discord hat die Verbindung dauerhaft geschlossen (Code %s: %s).\n"
                     "   4004/4010/4011/4012/4013/4014 = Token oder Intents sind falsch.\n"
-                    "   Bitte Token prüfen und die Intents im Developer Portal kontrollieren.",
-                    exc.code, exc.reason,
+                    "   Bitte Token prüfen und die Intents im Developer Portal kontrollieren.\n"
+                    "   Der Web-Server bleibt erreichbar, neuer Versuch alle %.0f s.",
+                    exc.code, exc.reason, config.fatal_retry_seconds,
                 )
-                raise
-            log.warning("Gateway-Verbindung getrennt (Code %s) — neuer Versuch in 5 s.",
-                        getattr(exc, "code", "?"))
-            await _sleep_or_stop(stop, 5)
+                await wait_and_report(
+                    config.fatal_retry_seconds, "connection_refused",
+                    f"Gateway dauerhaft geschlossen (Code {getattr(exc, 'code', '?')})",
+                )
+                continue
+            delay = backoff()
+            log.warning("Gateway-Verbindung getrennt (Code %s) — neuer Versuch in %.0f s.",
+                        getattr(exc, "code", "?"), delay)
+            await wait_and_report(
+                delay, "waiting",
+                f"Gateway getrennt (Code {getattr(exc, 'code', '?')})",
+            )
             continue
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
@@ -215,11 +431,14 @@ async def _connect_bot(
         except Exception:
             with contextlib.suppress(Exception):
                 await client.close()
-            log.exception("Unerwarteter Fehler beim Bot-Start (Versuch %d).", attempt)
-            await _sleep_or_stop(stop, 10)
+            delay = backoff()
+            log.exception("Unerwarteter Fehler beim Bot-Start (Versuch %d) — neuer Versuch in %.0f s.",
+                          attempt, delay)
+            await wait_and_report(delay, "waiting", "Unerwarteter Fehler beim Bot-Start (siehe Log)")
             continue
 
         # client.start() kehrt nur bei sauberem close() zurück
+        state.discord_status = "closed"
         log.info("Bot-Verbindung beendet.")
         break
 

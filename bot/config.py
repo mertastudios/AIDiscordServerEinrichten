@@ -104,6 +104,26 @@ class Config:
     log_level: str = "INFO"
     enable_privileged_intents: bool = True
     extra_scopes: List[str] = field(default_factory=list)
+    login_retry_base_seconds: float = 15.0
+    """
+    Basis für das exponentielle Backoff nach fehlgeschlagenen Discord-Logins.
+
+    Der n-te Fehlversuch in Folge wartet ca. ``base * 2^(n-1)`` Sekunden
+    (mit Zufalls-Jitter, gedeckelt auf ``login_retry_max_seconds``). So flutet
+    der Bot Discord nach einem 429/Cloudflare-Bann nicht mit Login-Versuchen —
+    jeder Versuch während des Banns würde ihn nämlich verlängern.
+    """
+    login_retry_max_seconds: float = 600.0
+    """Obergrenze eines einzelnen Wartezyklus nach fehlgeschlagenem Login."""
+    fatal_retry_seconds: float = 300.0
+    """
+    Wartezeit nach *fatalen* Login-Fehlern (ungültiger Token, dauerhaft vom
+    Gateway abgewiesene Verbindung).
+
+    Der Prozess beendet sich bewusst NICHT (kein Crash-Loop → kein Login-Spam
+    → kein Cloudflare-Bann); Web-Server und /api/health bleiben erreichbar,
+    der Login wird in diesem Abstand erneut versucht.
+    """
     settle_scale: float = 1.0
     """
     Faktor für alle Cache-Wartezeiten nach Schreibaktionen.
@@ -213,6 +233,9 @@ def load_config() -> Config:
         enable_privileged_intents=_bool("PRIVILEGED_INTENTS", True),
         extra_scopes=_list("EXTRA_SCOPES"),
         settle_scale=_float("SETTLE_SCALE", 1.0),
+        login_retry_base_seconds=_float("LOGIN_RETRY_BASE_SECONDS", 15.0),
+        login_retry_max_seconds=_float("LOGIN_RETRY_MAX_SECONDS", 600.0),
+        fatal_retry_seconds=_float("FATAL_RETRY_SECONDS", 300.0),
     )
 
     if cfg.session_ttl_hours < 0:
@@ -221,6 +244,14 @@ def load_config() -> Config:
         raise ConfigError("MAX_SESSIONS_PER_GUILD muss mindestens 1 sein.")
     if not 0.0 <= cfg.settle_scale <= 10.0:
         raise ConfigError("SETTLE_SCALE muss zwischen 0 und 10 liegen (0 = keine Wartezeiten).")
+    if cfg.login_retry_base_seconds <= 0:
+        raise ConfigError("LOGIN_RETRY_BASE_SECONDS muss größer als 0 sein.")
+    if cfg.login_retry_max_seconds < cfg.login_retry_base_seconds:
+        raise ConfigError("LOGIN_RETRY_MAX_SECONDS darf nicht kleiner als LOGIN_RETRY_BASE_SECONDS sein.")
+    if cfg.login_retry_max_seconds > 3600:
+        raise ConfigError("LOGIN_RETRY_MAX_SECONDS darf höchstens 3600 sein.")
+    if cfg.fatal_retry_seconds <= 0:
+        raise ConfigError("FATAL_RETRY_SECONDS muss größer als 0 sein.")
     if cfg.log_level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
         cfg.log_level = "INFO"
 
