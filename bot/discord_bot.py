@@ -444,7 +444,10 @@ class RelayClient(discord.Client):
         status.on_error = self._on_command_error  # type: ignore[assignment]
         revoke.on_error = self._on_command_error  # type: ignore[assignment]
 
-        self.add_listener(self._on_regenerate_button, "on_interaction")
+        # Kein add_listener() hier: das gibt es nur auf commands.Bot, nicht auf
+        # discord.Client. Button-Klicks bedient stattdessen die Methode
+        # ``on_interaction`` weiter unten — discord.py ruft für JEDE
+        # Interaktion getattr(self, "on_interaction") auf.
 
     # ── Rechteprüfung ────────────────────────────────────────────────────────
     async def _guard(
@@ -623,7 +626,11 @@ class RelayClient(discord.Client):
         )
 
     # ── Button-Handler ───────────────────────────────────────────────────────
-    async def _on_regenerate_button(self, interaction: discord.Interaction) -> None:
+    async def on_interaction(self, interaction: discord.Interaction) -> None:
+        """
+        Wird von discord.py für JEDE Interaktion gerufen; Slash-Commands
+        gehen über den CommandTree, hier zählen nur Komponenten-Klicks.
+        """
         if interaction.type is not discord.InteractionType.component:
             return
         custom_id = (interaction.data or {}).get("custom_id", "")
