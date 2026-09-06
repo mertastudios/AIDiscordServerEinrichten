@@ -1,0 +1,87 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  AIDiscordServerEinrichten — Betrieb auf einem eigenen Server (Docker)
+#
+#  Warum ein eigener Server?
+#    Auf Render Free teilt sich der Bot die ausgehende IP mit hunderten anderen
+#    Mietern. Sperrt Cloudflare diese IP für discord.com (HTTP 429 / Error 1015),
+#    kommt KEIN Bot aus diesem Pool mehr rein — egal wie korrekt er ist. Ein
+#    kleiner VPS (Hetzner CX22 ≈ 4 €/Monat) hat eine EIGENE IPv4: kein geteilter
+#    Pool, kein Spin-down, kein UptimeRobot nötig, Sessions überleben Neustarts.
+#
+#  Schnellstart (auf dem Server, als root oder mit sudo):
+#    curl -fsSL https://get.docker.com | sh
+#    git clone https://github.com/mertastudios/AIDiscordServerEinrichten.git
+#    cd AIDiscordServerEinrichten/deploy
+#    cp relay.env.example relay.env && nano relay.env      # Token + PUBLIC_URL
+#    docker compose up -d --build
+#    docker compose logs -f relay                          # „… ist ONLINE" abwarten
+#
+#  Vollständige Anleitung: README.md → „Betrieb auf einem eigenen Server"
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  relay:
+    build:
+      context: ..                 # Repo-Wurzel — nutzt das vorhandene Dockerfile
+      dockerfile: Dockerfile
+    image: aidiscordservereinrichten:local
+    container_name: adse-relay
+    restart: unless-stopped       # überlebt Reboots UND den bewussten Exit-Code 3
+    env_file:
+      - relay.env                 # DISCORD_BOT_TOKEN, PUBLIC_URL, …  (nicht in Git!)
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8080"
+      DATA_DIR: /app/data
+      # Eigene IP ⇒ ein Neustart bringt keine andere Adresse. Sollte die IP
+      # trotzdem je gesperrt sein, ist Proben + Warten die richtige Reaktion,
+      # kein Container-Roulette.
+      RESTART_ON_IP_BAN: "false"
+    ports:
+      # Nur lokal binden — nach außen geht es über den Reverse-Proxy (Caddy).
+      # Ohne Caddy/TLS stattdessen "8080:8080" und PUBLIC_URL=http://<IP>:8080.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - relay-data:/app/data      # Sessions + Neustart-Buch überleben Neustarts
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # 512 MB reichen locker (der Bot braucht ~80–120 MB); schützt den VPS
+    # vor einem Amoklauf, falls doch mal etwas leckt.
+    mem_limit: 512m
+
+  # ── Reverse-Proxy mit automatischem HTTPS (Let's Encrypt) ──────────────────
+  # Arena AI muss den Relay über eine öffentliche https://-URL erreichen.
+  # Voraussetzung: ein DNS-A-Record (z. B. relay.deine-domain.tld) zeigt auf
+  # die IPv4 des Servers, Ports 80 + 443 sind in der Firewall offen.
+  # Keine Domain? Dann Caddy entfernen, Port 8080 freigeben und
+  # PUBLIC_URL=http://<Server-IP>:8080 setzen (ohne TLS — geht, ist aber unschön).
+  caddy:
+    image: caddy:2-alpine
+    container_name: adse-caddy
+    restart: unless-stopped
+    env_file:
+      - relay.env                 # liest RELAY_DOMAIN
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - relay
+
+volumes:
+  relay-data:
+  caddy-data:
+  caddy-config:

@@ -184,6 +184,16 @@ async def t_public(h: Harness) -> None:
     root = await h.anon.call("GET", "/")
     check("GET / → 200 ok", root["status"] == 200 and root["json"].get("ok") is True)
 
+    diag = await h.anon.call("GET", "/api/diagnostics")
+    check("GET /api/diagnostics ohne Token → 200", diag["status"] == 200, str(diag["json"])[:200])
+    ddata = diag["json"].get("data", {})
+    check("diagnostics nennt verdict + what_to_do",
+          "verdict" in ddata and isinstance(ddata.get("what_to_do"), list), str(ddata)[:200])
+    check("diagnostics nennt Neustart-Buch + Plattform-Urteil",
+          isinstance(ddata.get("restarts"), dict) and "platform_verdict" in ddata, str(ddata)[:200])
+    check("diagnostics verrät kein Token",
+          "adse_" not in diag["text"] and os.environ["DISCORD_BOT_TOKEN"] not in diag["text"])
+
     console = await h.anon.call("GET", "/console")
     check("GET /console → HTML", console["status"] == 200
           and "text/html" in console["headers"].get("Content-Type", ""))

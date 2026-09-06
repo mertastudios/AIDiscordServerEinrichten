@@ -24,3 +24,6 @@ scripts/
 !.env.example
 .DS_Store
 render.yaml
+# Deploy-Artefakte (VPS/Fly/Proxy) werden im Image nicht gebraucht
+deploy/
+fly.toml

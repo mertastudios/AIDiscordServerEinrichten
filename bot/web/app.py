@@ -9,6 +9,7 @@ discord.py ohnehin mitbringt) die richtige Wahl statt FastAPI + Uvicorn.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import secrets
@@ -59,6 +60,17 @@ class AppState:
         self.login_failures: int = 0
         self.ban_watches: int = 0
         self.restart_requested: Optional[str] = None
+        # Neustart-Buch (bot.restarts.RestartLedger): zählt bewusste Neustarts
+        # wegen IP-Sperre über Prozessgrenzen hinweg und merkt sich die dabei
+        # gesehenen Ausgangs-IPs. None, solange main() es nicht gesetzt hat.
+        self.restart_ledger: Optional[Any] = None
+        # Ausgangs-IPs, die dieser Prozess selbst gemessen hat (in Reihenfolge,
+        # ohne Doppelte) — zeigt, ob sich die IP innerhalb eines Containers ändert.
+        self.egress_ips_seen: list = []
+        self.egress_ip_changes: int = 0
+        # Gesetzt, wenn das Neustart-Limit erreicht ist: Der Bot würfelt nicht
+        # mehr, sondern probt nur noch. Text = Begründung für Log/Diagnose.
+        self.platform_verdict: Optional[str] = None
         self.commands_synced_at: Optional[Any] = None
         self._net_ready: Optional[asyncio.Event] = None
         self.started_at = time.monotonic()
@@ -89,11 +101,35 @@ class AppState:
             self._net_ready = asyncio.Event()
         return self._net_ready
 
-    def set_net_report(self, report: Any) -> None:
-        """Hinterlegt ein :class:`bot.netcheck.NetReport` und weckt Wartende."""
+    def set_net_report(self, report: Any) -> Optional[bool]:
+        """
+        Hinterlegt ein :class:`bot.netcheck.NetReport` und weckt Wartende.
+
+        Liefert ``True``, wenn der Report eine **andere** Ausgangs-IP zeigt als
+        die zuletzt gemessene (``False`` = gleiche IP, ``None`` = keine IP im
+        Report). Reports ohne IP-Messung (``with_egress_ip=False``) erben die
+        zuletzt bekannte IP, damit ``/api/health`` sie nicht verliert.
+        """
+        previous = getattr(self.net_report, "egress_ip", None)
+        new_ip = getattr(report, "egress_ip", None)
+        changed: Optional[bool] = None
+        if new_ip:
+            if new_ip not in self.egress_ips_seen:
+                self.egress_ips_seen.append(new_ip)
+                self.egress_ips_seen = self.egress_ips_seen[-32:]
+            if previous:
+                changed = new_ip != previous
+                if changed:
+                    self.egress_ip_changes += 1
+        elif previous is not None and hasattr(report, "egress_ip"):
+            # Probe ohne IP-Messung: alte Messung übernehmen.
+            with contextlib.suppress(Exception):
+                report.egress_ip = previous
+                report.egress_source = getattr(self.net_report, "egress_source", None)
         self.net_report = report
         self.net_checked_mono = time.monotonic()
         self.net_ready().set()
+        return changed
 
     def net_report_age(self) -> float:
         """Alter der letzten Diagnose in Sekunden (``inf``, wenn es keine gibt)."""

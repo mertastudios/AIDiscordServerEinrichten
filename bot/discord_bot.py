@@ -211,6 +211,14 @@ class RelayClient(discord.Client):
         self.state.discord_status = "online"
         self.state.discord_last_error = None
         self.state.discord_retry_at = None
+        self.state.platform_verdict = None
+        # Erfolgreicher Login ⇒ Neustart-Zähler (IP-Sperre) zurücksetzen.
+        ledger = getattr(self.state, "restart_ledger", None)
+        if ledger is not None:
+            try:
+                ledger.clear(reason="Login erfolgreich")
+            except Exception as exc:  # noqa: BLE001 — Buchführung darf on_ready nie stören
+                log.debug("Neustart-Buch nicht zurücksetzbar: %s", exc)
         user = self.user
         guild_names = ", ".join(g.name for g in self.guilds[:8]) or "(keine)"
         log.info("═" * 68)

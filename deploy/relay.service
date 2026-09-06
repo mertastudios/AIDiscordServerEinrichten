@@ -1,0 +1,71 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  AIDiscordServerEinrichten — systemd-Unit (Betrieb OHNE Docker)
+#
+#  Einrichtung (Debian 12 / Ubuntu 22.04+, als root):
+#
+#    apt-get update && apt-get install -y git python3 python3-venv
+#    useradd --system --home /opt/adse-relay --shell /usr/sbin/nologin adse
+#    git clone https://github.com/mertastudios/AIDiscordServerEinrichten.git /opt/adse-relay
+#    python3 -m venv /opt/adse-relay/.venv
+#    /opt/adse-relay/.venv/bin/pip install -r /opt/adse-relay/requirements.txt
+#    mkdir -p /var/lib/adse-relay /etc/adse-relay
+#    cp /opt/adse-relay/deploy/relay.env.example /etc/adse-relay/relay.env
+#    nano /etc/adse-relay/relay.env            # DISCORD_BOT_TOKEN + PUBLIC_URL eintragen
+#    chmod 600 /etc/adse-relay/relay.env
+#    chown -R adse:adse /opt/adse-relay /var/lib/adse-relay
+#    cp /opt/adse-relay/deploy/relay.service /etc/systemd/system/adse-relay.service
+#    systemctl daemon-reload
+#    systemctl enable --now adse-relay
+#    journalctl -u adse-relay -f                # „… ist ONLINE" abwarten
+#
+#  Update später:
+#    cd /opt/adse-relay && sudo -u adse git pull && systemctl restart adse-relay
+#
+#  HTTPS davor: Caddy (apt install caddy) mit
+#    relay.deine-domain.tld { reverse_proxy 127.0.0.1:8080 }
+#  in /etc/caddy/Caddyfile — Zertifikat kommt automatisch.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[Unit]
+Description=AIDiscordServerEinrichten — Discord ⇄ Arena AI Relay-Bot
+Documentation=https://github.com/mertastudios/AIDiscordServerEinrichten
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=adse
+Group=adse
+WorkingDirectory=/opt/adse-relay
+EnvironmentFile=/etc/adse-relay/relay.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/adse-relay/.venv/bin/python -m bot
+
+# Neustart bei jedem Ende — auch beim bewussten Exit-Code 3 (IP-Sperre).
+# 15 s Pause verhindern einen Heißloop, falls z. B. das Token fehlt.
+Restart=always
+RestartSec=15
+# Nicht öfter als 10× in 10 Minuten neu starten (sonst Fehlerzustand statt Dauerloop).
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+# Sauberes Herunterfahren: SIGTERM → Bot schließt Gateway + speichert Sessions.
+KillSignal=SIGTERM
+TimeoutStopSec=25
+
+# ── Härtung ─────────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/adse-relay
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

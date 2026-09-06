@@ -156,6 +156,40 @@ class Config:
     """
     restart_delay_seconds: float = 30.0
     """Wartezeit vor dem bewussten Neustart — Zeit für einen sauberen Shutdown."""
+    restart_max_cycles: int = 5
+    """
+    So viele Neustart-Zyklen (Exit-Code 3) darf der Bot wegen einer gesperrten
+    IP hintereinander versuchen. Danach hört er auf zu würfeln, probt nur noch
+    in Ruhe weiter und sagt in Log und ``GET /api/diagnostics`` klar: *Diese
+    Plattform kommt nicht durch — eigene Ausgangs-IP nötig.*
+
+    Der Zähler liegt in ``DATA_DIR/restart_ledger.json``; er überlebt Neustarts
+    nur auf einem persistenten Dateisystem (VPS, Docker-Volume, Render-Disk).
+    Auf Render Free beginnt jeder Container bei 0. ``0`` = unbegrenzt würfeln.
+    """
+    ban_fast_restart_above_seconds: float = 600.0
+    """
+    Nennt Cloudflare in der Blockseite ein ``Retry-After`` oberhalb dieses
+    Werts (und oberhalb von ``ban_watch_seconds``), wird das Beobachtungs-
+    fenster auf ``ban_fast_restart_watch_seconds`` verkürzt und dann neu
+    gestartet: Zehn Minuten in eine Sperre hinein zu proben, die laut Header
+    noch zwei Stunden hält, kostet nur Zeit — jeder Neustart ist dagegen ein
+    neuer Wurf auf eine andere Adresse. ``0`` = aus (immer volles Fenster).
+    """
+    ban_fast_restart_watch_seconds: float = 90.0
+    """
+    Verkürztes Beobachtungsfenster im Schnell-Neustart-Fall (s. o.). Drei
+    Proben à 30 s bestätigen, dass die Sperre echt ist, und begrenzen die
+    Neustart-Rate auf etwa einen Zyklus pro 2–3 Minuten — wichtig auf
+    Plattformen mit flüchtigem Dateisystem, wo der Zyklus-Zähler nicht
+    überlebt und sonst ein Heißloop entstünde.
+    """
+    ban_egress_recheck_every: int = 5
+    """
+    Während einer Sperre wird bei jeder n-ten Probe die ausgehende IP neu
+    gemessen und ein Wechsel geloggt. Beantwortet die entscheidende Frage,
+    ob die Plattform die Adresse überhaupt je ändert. ``0`` = nur beim Start.
+    """
     discord_proxy: str = ""
     """
     HTTP(S)-Proxy für **alle** Discord-Verbindungen (REST *und* Gateway),
@@ -302,6 +336,10 @@ def load_config() -> Config:
         ban_watch_seconds=_float("BAN_WATCH_SECONDS", 600.0),
         restart_on_ip_ban=_bool("RESTART_ON_IP_BAN", True),
         restart_delay_seconds=_float("RESTART_DELAY_SECONDS", 30.0),
+        restart_max_cycles=_int("RESTART_MAX_CYCLES", 5),
+        ban_fast_restart_above_seconds=_float("BAN_FAST_RESTART_ABOVE_SECONDS", 600.0),
+        ban_fast_restart_watch_seconds=_float("BAN_FAST_RESTART_WATCH_SECONDS", 90.0),
+        ban_egress_recheck_every=_int("BAN_EGRESS_RECHECK_EVERY", 5),
         discord_proxy=_str("DISCORD_PROXY", ""),
         discord_proxy_user=_str("DISCORD_PROXY_USER", ""),
         discord_proxy_password=_str("DISCORD_PROXY_PASSWORD", ""),
@@ -330,6 +368,14 @@ def load_config() -> Config:
                           "(0 = unbegrenzt probieren, kein Neustart).")
     if cfg.restart_delay_seconds < 0 or cfg.restart_delay_seconds > 600:
         raise ConfigError("RESTART_DELAY_SECONDS muss zwischen 0 und 600 liegen.")
+    if cfg.restart_max_cycles < 0 or cfg.restart_max_cycles > 1000:
+        raise ConfigError("RESTART_MAX_CYCLES muss zwischen 0 und 1000 liegen (0 = unbegrenzt).")
+    if cfg.ban_fast_restart_above_seconds < 0 or cfg.ban_fast_restart_above_seconds > 86400:
+        raise ConfigError("BAN_FAST_RESTART_ABOVE_SECONDS muss zwischen 0 und 86400 liegen (0 = aus).")
+    if cfg.ban_fast_restart_watch_seconds < 0 or cfg.ban_fast_restart_watch_seconds > 7200:
+        raise ConfigError("BAN_FAST_RESTART_WATCH_SECONDS muss zwischen 0 und 7200 liegen.")
+    if cfg.ban_egress_recheck_every < 0 or cfg.ban_egress_recheck_every > 1000:
+        raise ConfigError("BAN_EGRESS_RECHECK_EVERY muss zwischen 0 und 1000 liegen (0 = aus).")
     if cfg.discord_proxy and not re.match(r"^https?://", cfg.discord_proxy):
         raise ConfigError(
             f"DISCORD_PROXY muss mit http:// oder https:// beginnen (Wert: "

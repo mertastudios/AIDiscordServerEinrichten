@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Caddy — HTTPS-Reverse-Proxy vor dem Relay (automatisches Let's-Encrypt-Zertifikat)
+#
+#  RELAY_DOMAIN kommt aus relay.env (z. B. relay.deine-domain.tld). Der DNS-
+#  A-Record muss auf die IPv4 des Servers zeigen, BEVOR Caddy startet — sonst
+#  schlägt die Zertifikatsausstellung fehl (Caddy versucht es dann automatisch
+#  weiter, aber der Bot ist so lange nicht per HTTPS erreichbar).
+# ─────────────────────────────────────────────────────────────────────────────
+
+{$RELAY_DOMAIN} {
+	encode zstd gzip
+
+	# Der Relay lernt seine öffentliche URL aus diesen Headern (falls PUBLIC_URL
+	# nicht gesetzt ist) — Caddy setzt X-Forwarded-Proto/Host automatisch.
+	reverse_proxy relay:8080 {
+		# Health-Check durch Caddy selbst (optional, hübsch im Log)
+		health_uri /api/health
+		health_interval 30s
+	}
+
+	# Sicherheits-Header (der Relay setzt eigene; diese schaden nicht)
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

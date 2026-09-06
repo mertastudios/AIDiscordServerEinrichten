@@ -122,15 +122,21 @@ def server_error(status: int = 500) -> discord.HTTPException:
     return discord.HTTPException(FakeResponse(status, {"Via": "1.1 google"}), "boom")
 
 
-def blocked_report(ip: str = "203.0.113.7") -> NetReport:
-    """Report: ausgehende IP wird von Cloudflare blockiert."""
+def blocked_report(ip: str = "203.0.113.7", retry_after: Optional[float] = 120.0) -> NetReport:
+    """
+    Report: ausgehende IP wird von Cloudflare blockiert.
+
+    ``retry_after`` klein (Default 120 s) ⇒ normales 10-Minuten-Fenster.
+    Werte oberhalb von ``BAN_FAST_RESTART_ABOVE_SECONDS`` (600 s) lösen den
+    verkürzten Schnell-Neustart aus — siehe Test B4.
+    """
     return NetReport(
         verdict=VERDICT_IP_BLOCKED,
         egress_ip=ip,
         egress_source="https://api.ipify.org",
         discord=ProbeResult(url=DISCORD_PROBE_URL, status=429, blocked=True,
                             cloudflare_page=True, cf_ray="deadbeef-FRA",
-                            retry_after=3600.0, ok=False),
+                            retry_after=retry_after, ok=False),
         hint="Cloudflare blockt die ausgehende IP.",
         checked_at="2026-01-01T00:00:00Z",
     )
@@ -192,6 +198,7 @@ class Scenario:
         self.start_calls = 0
         self.probe_calls = 0
         self.status_seen: List[str] = []
+        self.errors_seen: List[str] = []
         self.config = Config(**{
             "discord_token": "recovery.test.token",
             "ban_probe_interval_seconds": 30.0,
@@ -240,6 +247,7 @@ class Scenario:
         # Beim Warten ist der interessante Status gesetzt (wait_and_report bzw.
         # _watch_ip_ban setzen ihn unmittelbar vorher).
         self.status_seen.append(self.state.discord_status)
+        self.errors_seen.append(self.state.discord_last_error or "")
         self.clock.sleep(seconds)
 
     async def _fake_netcheck(self, **kwargs: Any) -> NetReport:
@@ -399,6 +407,215 @@ async def test_unlimited_watch() -> None:
           f"start_calls={scenario.start_calls}")
     check("B3: kein langer Blind-Schlaf", scenario.longest_wait <= 60.0,
           f"längste Wartezeit {scenario.longest_wait:.0f} s")
+
+
+async def test_fast_restart_on_long_retry_after() -> None:
+    print("\n── B4: Retry-After 8034 s → verkürztes Fenster, schneller Neustart ─")
+
+    # Exakt der gemessene Render-Fall: Cloudflare-Ray …-PDX, Retry-After 8034 s.
+    long_ban = blocked_report(ip="74.220.48.143", retry_after=8034.0)
+    scenario = Scenario(
+        reports=[long_ban] * 40,
+        start_behavior=lambda call: cloudflare_429("8034"),
+    )
+    with scenario:
+        exc = await scenario.run(first_report=long_ban)
+
+    check("B4: RestartRequested geworfen", isinstance(exc, botmain.RestartRequested), f"{exc!r}")
+    check("B4: nur 3 Proben statt 20 (Fenster 90 s statt 600 s)",
+          scenario.probe_calls == 3, f"probe_calls={scenario.probe_calls}")
+    total = sum(scenario.clock.slept)
+    check("B4: Gesamtwartezeit bis zum Neustart ≤ 150 s (90 s Proben + 30 s Delay)",
+          total <= 150.0, f"{total:.0f} s")
+    check("B4: kein Login-Versuch in die aktive Sperre", scenario.start_calls == 0,
+          f"start_calls={scenario.start_calls}")
+    check("B4: Neustart im Buch verzeichnet (Zyklus 1)",
+          scenario.state.restart_ledger is not None and scenario.state.restart_ledger.cycles == 1,
+          str(getattr(scenario.state.restart_ledger, "cycles", None)))
+    check("B4: gesperrte IP im Buch",
+          "74.220.48.143" in getattr(scenario.state.restart_ledger, "ips", []),
+          str(getattr(scenario.state.restart_ledger, "ips", None)))
+
+    # Gegenprobe: kurzer Retry-After ⇒ volles Fenster (kein Schnell-Neustart).
+    short_ban = blocked_report(retry_after=300.0)
+    scenario = Scenario(reports=[short_ban] * 40, start_behavior=lambda call: cloudflare_429("300"))
+    with scenario:
+        exc = await scenario.run(first_report=short_ban)
+    check("B4: Retry-After 300 s ⇒ normales Fenster (20 Proben)",
+          scenario.probe_calls == 20, f"probe_calls={scenario.probe_calls}")
+
+    # Schnell-Neustart abgeschaltet ⇒ volles Fenster trotz langem Retry-After.
+    scenario = Scenario(reports=[long_ban] * 40, start_behavior=lambda call: cloudflare_429("8034"),
+                        config_overrides={"ban_fast_restart_above_seconds": 0.0})
+    with scenario:
+        await scenario.run(first_report=long_ban)
+    check("B4: BAN_FAST_RESTART_ABOVE_SECONDS=0 ⇒ volles Fenster",
+          scenario.probe_calls == 20, f"probe_calls={scenario.probe_calls}")
+
+
+async def test_restart_cycle_limit() -> None:
+    print("\n── B5: Neustart-Limit → aufhören zu würfeln, nur noch proben ────")
+    import tempfile
+
+    from bot.restarts import RestartLedger
+
+    data_dir = tempfile.mkdtemp(prefix="adse-ledger-")
+    ban = blocked_report(ip="74.220.48.143")
+    cycles_seen: List[int] = []
+
+    # Fünf „Container-Leben" hintereinander — jedes lädt das Buch vom letzten.
+    for life in range(1, 6):
+        scenario = Scenario(reports=[ban] * 40, start_behavior=lambda call: cloudflare_429(),
+                            config_overrides={"restart_max_cycles": 5})
+        scenario.state.restart_ledger = RestartLedger.open(data_dir)
+        with scenario:
+            exc = await scenario.run(first_report=ban)
+        cycles_seen.append(scenario.state.restart_ledger.cycles)
+        check(f"B5: Leben {life} endet mit RestartRequested",
+              isinstance(exc, botmain.RestartRequested), f"{exc!r}")
+
+    check("B5: Zyklen zählen über Prozessgrenzen hoch (1…5)", cycles_seen == [1, 2, 3, 4, 5],
+          str(cycles_seen))
+    check("B5: Buch liegt auf Platte",
+          os.path.exists(os.path.join(data_dir, "restart_ledger.json")))
+
+    # Sechstes Leben: Limit erreicht ⇒ KEIN Neustart mehr, nur Proben + Abkühlen.
+    scenario = Scenario(reports=[ban] * 200, start_behavior=lambda call: cloudflare_429(),
+                        config_overrides={"restart_max_cycles": 5})
+    scenario.state.restart_ledger = RestartLedger.open(data_dir)
+    ledger = scenario.state.restart_ledger
+    check("B5: Buch beim Start geladen (5 Zyklen)", ledger.cycles == 5 and ledger.found_at_start,
+          f"cycles={ledger.cycles} found={ledger.found_at_start}")
+    check("B5: exhausted() bei 5/5", ledger.exhausted(5))
+
+    # Zwei Beobachtungsfenster + Abkühlphasen durchlaufen lassen, dann stoppen.
+    probes_before_stop = 45
+
+    async def counting_netcheck(**kwargs: Any) -> NetReport:
+        scenario.probe_calls += 1
+        if scenario.probe_calls >= probes_before_stop:
+            scenario.stop.set()
+        return ban
+
+    with scenario:
+        botmain.run_netcheck = counting_netcheck  # type: ignore[assignment]
+        exc = await scenario.run(first_report=ban)
+
+    check("B5: nach dem Limit KEIN RestartRequested",
+          not isinstance(exc, botmain.RestartRequested), f"{exc!r}")
+    check("B5: Zähler bleibt bei 5 (kein weiterer Zyklus gebucht)", ledger.cycles == 5,
+          str(ledger.cycles))
+    check("B5: Plattform-Urteil gesetzt", bool(scenario.state.platform_verdict),
+          str(scenario.state.platform_verdict)[:120])
+    check("B5: Urteil nennt die IP und die Lösung",
+          "74.220.48.143" in (scenario.state.platform_verdict or "")
+          and "VPS" in (scenario.state.platform_verdict or ""),
+          str(scenario.state.platform_verdict)[:200])
+    check("B5: Abkühlphase ≥ 120 s zwischen den Fenstern", scenario.longest_wait >= 120.0,
+          f"{scenario.longest_wait:.0f} s")
+    check("B5: weiter probiert (≥ 40 Proben)", scenario.probe_calls >= 40,
+          f"probe_calls={scenario.probe_calls}")
+    check("B5: Status ip_blocked", scenario.state.discord_status == "ip_blocked",
+          scenario.state.discord_status)
+    check("B5: last_error nannte das Plattform-Limit während der Abkühlphase",
+          any("Plattform-Limit" in e for e in scenario.errors_seen),
+          str(scenario.errors_seen[-3:]))
+
+    # Erfolgreicher Login ⇒ Buch wird gelöscht.
+    ledger.clear(reason="Test")
+    check("B5: clear() entfernt die Datei",
+          not os.path.exists(os.path.join(data_dir, "restart_ledger.json")))
+    check("B5: clear() setzt Zähler zurück", ledger.cycles == 0 and ledger.ips == [])
+
+    # RESTART_MAX_CYCLES=0 ⇒ unbegrenzt.
+    scenario = Scenario(reports=[ban] * 40, start_behavior=lambda call: cloudflare_429(),
+                        config_overrides={"restart_max_cycles": 0})
+    scenario.state.restart_ledger = RestartLedger(path=None, cycles=99)
+    with scenario:
+        exc = await scenario.run(first_report=ban)
+    check("B5: RESTART_MAX_CYCLES=0 ⇒ trotz 99 Zyklen weiter neu starten",
+          isinstance(exc, botmain.RestartRequested), f"{exc!r}")
+
+
+def test_ledger_units() -> None:
+    print("\n── Unit: Neustart-Buch (RestartLedger) ───────────────────────")
+    import tempfile
+
+    from bot.restarts import RestartLedger
+
+    data_dir = tempfile.mkdtemp(prefix="adse-ledger-unit-")
+    ledger = RestartLedger.open(data_dir)
+    check("frisches Buch: 0 Zyklen, nicht gefunden", ledger.cycles == 0 and not ledger.found_at_start)
+    check("frisches Buch: persistent unbekannt", ledger.persistent is None)
+    check("note_boot_ip ohne Vergleichsbasis → None", ledger.note_boot_ip("198.51.100.1") is None)
+
+    ledger.record_restart(egress_ip="198.51.100.1", cause="Test")
+    check("record_restart zählt hoch", ledger.cycles == 1)
+    check("record_restart schreibt Datei", ledger.saved_ok is True)
+
+    reloaded = RestartLedger.open(data_dir)
+    check("Reload: Zyklus 1 gelesen", reloaded.cycles == 1 and reloaded.found_at_start, str(reloaded.cycles))
+    check("Reload: persistent = True", reloaded.persistent is True)
+    check("Reload: letzte IP bekannt", reloaded.last_ip == "198.51.100.1")
+    check("dieselbe IP nach Neustart → False", reloaded.note_boot_ip("198.51.100.1") is False)
+    check("same_ip_streak = 1", reloaded.same_ip_streak == 1, str(reloaded.same_ip_streak))
+    check("andere IP nach Neustart → True", reloaded.note_boot_ip("198.51.100.2") is True)
+    check("streak zurück auf 0", reloaded.same_ip_streak == 0)
+    check("beide IPs gemerkt", reloaded.ips == ["198.51.100.1", "198.51.100.2"], str(reloaded.ips))
+    check("remaining(5) = 4", reloaded.remaining(5) == 4)
+    check("remaining(0) = None (unbegrenzt)", reloaded.remaining(0) is None)
+    check("exhausted(1) = True", reloaded.exhausted(1))
+    data = reloaded.to_dict(5)
+    check("to_dict enthält Kernfelder",
+          {"cycles", "ips_seen", "history", "exhausted", "ledger_persistent"} <= set(data))
+    check("summary nennt Zyklus und IPs",
+          "Zyklus 1/5" in reloaded.summary(5) and "198.51.100.2" in reloaded.summary(5),
+          reloaded.summary(5))
+
+    # Verjährung: uralter Stand wird verworfen.
+    import json as _json
+    path = os.path.join(data_dir, "restart_ledger.json")
+    with open(path, encoding="utf-8") as fh:
+        raw = _json.load(fh)
+    raw["updated_at"] = "2020-01-01T00:00:00Z"
+    with open(path, "w", encoding="utf-8") as fh:
+        _json.dump(raw, fh)
+    stale = RestartLedger.open(data_dir)
+    check("verjährter Stand → 0 Zyklen, stale_at_start", stale.cycles == 0 and stale.stale_at_start)
+
+    # Kaputte Datei darf nichts kaputt machen.
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("{ kaputt")
+    broken = RestartLedger.open(data_dir)
+    check("kaputte Datei → 0 Zyklen + load_error", broken.cycles == 0 and bool(broken.load_error))
+
+    # Ohne Pfad: rein im Speicher, save() = False, nie eine Exception.
+    mem = RestartLedger(path=None)
+    mem.record_restart(egress_ip=None, cause="x")
+    check("Speicher-Buch zählt, speichert aber nicht", mem.cycles == 1 and mem.saved_ok is False)
+    check("Speicher-Buch: persistent = False", mem.persistent is False)
+    mem.clear()
+    check("clear() im Speicher-Buch", mem.cycles == 0)
+
+
+def test_egress_tracking_units() -> None:
+    print("\n── Unit: Ausgangs-IP-Wechsel innerhalb eines Prozesses ──────")
+    cfg = load_config()
+    store = SessionStore(path=None, persist=False)
+    client = RelayClient(cfg, store, state=None)
+    state = AppState(client=client, config=cfg, store=store)
+
+    check("erste Messung → None", state.set_net_report(blocked_report(ip="10.0.0.1")) is None)
+    check("gleiche IP → False", state.set_net_report(blocked_report(ip="10.0.0.1")) is False)
+    check("andere IP → True", state.set_net_report(blocked_report(ip="10.0.0.2")) is True)
+    check("Wechsel gezählt", state.egress_ip_changes == 1, str(state.egress_ip_changes))
+    check("beide IPs gesehen", state.egress_ips_seen == ["10.0.0.1", "10.0.0.2"],
+          str(state.egress_ips_seen))
+    no_ip = blocked_report(ip=None)  # type: ignore[arg-type]
+    no_ip.egress_ip = None
+    check("Probe ohne IP-Messung → None", state.set_net_report(no_ip) is None)
+    check("… erbt die letzte bekannte IP (für /api/health)", state.egress_ip == "10.0.0.2",
+          str(state.egress_ip))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -697,10 +914,14 @@ async def arun() -> int:
     test_backoff_units()
     test_config_units()
     test_state_units()
+    test_ledger_units()
+    test_egress_tracking_units()
     await test_ip_ban_lifts()
     await test_ip_ban_persists()
     await test_ip_ban_persists_no_restart()
     await test_unlimited_watch()
+    await test_fast_restart_on_long_retry_after()
+    await test_restart_cycle_limit()
     await test_token_level_rate_limit()
     await test_real_ratelimit_is_capped()
     await test_backoff_escalates()

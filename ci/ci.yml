@@ -11,9 +11,9 @@
 #
 #  Läuft bei jedem Push und jedem Pull Request. Kein Discord-Token nötig:
 #  Der Smoke-Test startet den echten Web-Server gegen einen simulierten
-#  Discord-Client (scripts/_fake_discord.py) und fährt 199 Prüfungen,
+#  Discord-Client (scripts/_fake_discord.py) und fährt 203 Prüfungen,
 #  inklusive der vollständigen Ausführung aller fünf Setup-Vorlagen.
-#  Dazu kommt scripts/login_recovery_test.py (72 Prüfungen) für das Verhalten
+#  Dazu kommt scripts/login_recovery_test.py (130 Prüfungen) für das Verhalten
 #  bei 429 / Cloudflare Error 1015 — mit Fake-Uhr, also ohne Netzwerk.
 # ─────────────────────────────────────────────────────────────────────────────
 

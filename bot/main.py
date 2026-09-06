@@ -50,6 +50,7 @@ from .netcheck import (
     proxy_auth_from,
     run_netcheck,
 )
+from .restarts import RestartLedger
 from .sessions import SessionStore
 from .util import iso, now_utc
 from .web.app import AppState, build_app, start_web_server, stop_web_server
@@ -339,7 +340,12 @@ async def _run_netcheck(config: Config, state: AppState, *, with_egress_ip: bool
 
     Wirft nie: Eine Diagnose, die selbst fehlschlägt, darf den Bot nicht
     aufhalten — dann steht das Ergebnis eben als Fehler im Report.
+
+    Wechselt die gemessene Ausgangs-IP gegenüber der letzten Messung, wird das
+    ausdrücklich geloggt: Genau diese Information entscheidet, ob Neustarts auf
+    der Plattform überhaupt „würfeln" oder immer dieselbe Adresse liefern.
     """
+    previous_ip = getattr(state.net_report, "egress_ip", None)
     try:
         report = await run_netcheck(
             proxy=(config.discord_proxy or None),
@@ -352,8 +358,50 @@ async def _run_netcheck(config: Config, state: AppState, *, with_egress_ip: bool
         report = NetReport(verdict=VERDICT_NETWORK_ERROR,
                            hint=f"Diagnose nicht ausführbar: {exc}",
                            checked_at=iso(now_utc()) or "")
-    state.set_net_report(report)
+    changed = state.set_net_report(report)
+    if changed:
+        log.warning(
+            "🔀 Ausgangs-IP hat sich INNERHALB dieses Containers geändert: %s → %s "
+            "(bisher %d Wechsel, gesehen: %s). discord.com jetzt %s.",
+            previous_ip, report.egress_ip, state.egress_ip_changes,
+            ", ".join(state.egress_ips_seen[-6:]),
+            "erreichbar" if report.discord_reachable else "weiterhin gesperrt",
+        )
     return report
+
+
+def _restart_ledger(state: AppState) -> RestartLedger:
+    """Das Neustart-Buch aus dem Zustand — notfalls ein flüchtiges (Tests)."""
+    ledger = getattr(state, "restart_ledger", None)
+    if not isinstance(ledger, RestartLedger):
+        ledger = RestartLedger(path=None)
+        with contextlib.suppress(Exception):
+            state.restart_ledger = ledger
+    return ledger
+
+
+def _platform_gave_up_text(config: Config, ledger: RestartLedger) -> str:
+    """Klartext für Log + Diagnose, wenn das Neustart-Limit erreicht ist."""
+    ips = ", ".join(ledger.ips[-6:]) or "unbekannt"
+    distinct = len(ledger.ips)
+    if distinct <= 1:
+        dice = (
+            f"Jeder Neustart lieferte DIESELBE Ausgangs-IP ({ips}) — diese Plattform "
+            "würfelt nicht, sie hat hier faktisch eine feste, gesperrte Adresse."
+        )
+    else:
+        dice = (
+            f"{distinct} verschiedene Ausgangs-IPs gesehen ({ips}) — alle gesperrt. "
+            "Der komplette Ausgangs-Pool dieser Region ist bei Cloudflare verbrannt."
+        )
+    return (
+        f"Neustart-Limit erreicht ({ledger.cycles}/{config.restart_max_cycles} Zyklen ohne "
+        f"erfolgreichen Login). {dice} Weitere Neustarts bringen nichts; der Bot probt "
+        f"jetzt nur noch alle {config.ban_probe_interval_seconds:.0f} s in Ruhe weiter. "
+        "Lösung: eigene Ausgangs-IP — Option 1: kleiner VPS (deploy/docker-compose.yml, "
+        "README-Abschnitt 'Betrieb auf einem eigenen Server'); Option 2: Fly.io "
+        "(deploy/fly.toml); Option 3: Render behalten + DISCORD_PROXY mit statischer IP."
+    )
 
 
 def _log_report(report: Any, *, level: int = logging.INFO) -> None:
@@ -382,9 +430,32 @@ async def _watch_ip_ban(config: Config, state: AppState, stop: asyncio.Event, *,
     # keine Frist. Ohne diese Unterscheidung entstünde ein Heißloop, der Discord
     # mit Login-Versuchen flutet (genau das, was die Sperre verlängert).
     unlimited = budget <= 0.0
-    deadline = float("inf") if unlimited else time.monotonic() + budget
+    ledger = _restart_ledger(state)
+    may_restart = (
+        config.restart_on_ip_ban and not unlimited
+        and not ledger.exhausted(config.restart_max_cycles)
+    )
+    # Sagt Cloudflare selbst, dass die Sperre noch sehr lange hält (Retry-After
+    # weit über dem Beobachtungsfenster), ist ein volles 10-Minuten-Fenster
+    # verschwendet: Statt in eine 2-Stunden-Sperre hineinzuproben, wird das
+    # Fenster auf wenige Proben verkürzt (Bestätigung, dass die Sperre echt
+    # ist) und dann neu gestartet — jeder Neustart ist ein neuer Wurf auf eine
+    # andere Adresse, und Würfe pro Stunde sind hier die entscheidende Größe.
+    # Bewusst NICHT sofort: Auf einem flüchtigen Dateisystem überlebt der
+    # Zyklus-Zähler den Neustart nicht, und ohne Mindestfenster entstünde ein
+    # Heißloop aus Neustarts.
+    retry_after = getattr(getattr(report, "discord", None), "retry_after", None)
+    threshold = config.ban_fast_restart_above_seconds
+    fast = (
+        may_restart and threshold > 0 and retry_after is not None
+        and retry_after > max(threshold, budget)
+        and 0 < config.ban_fast_restart_watch_seconds < budget
+    )
+    if fast:
+        budget = max(probe_interval, config.ban_fast_restart_watch_seconds)
     watch_no = state.ban_watches
     probe_no = 0
+    recheck_every = max(0, int(config.ban_egress_recheck_every))
 
     log.error(
         "❌ Discord blockiert die AUSGEHENDE IP dieses Containers (%s).\n"
@@ -396,6 +467,16 @@ async def _watch_ip_ban(config: Config, state: AppState, stop: asyncio.Event, *,
         cause, probe_interval, "unbegrenzt" if unlimited else f"{budget:.0f} s",
     )
     _log_report(report, level=logging.ERROR)
+    if fast:
+        log.error(
+            "   ⏩ Cloudflare meldet Retry-After %.0f s — weit länger als das normale "
+            "Fenster (%.0f s). Beobachtung deshalb auf %.0f s verkürzt, danach "
+            "Neustart für eine neue Ausgangs-IP (BAN_FAST_RESTART_ABOVE_SECONDS=%.0f).",
+            retry_after, config.ban_watch_seconds, budget, threshold,
+        )
+    if ledger.cycles:
+        log.error("   %s", ledger.summary(config.restart_max_cycles))
+    deadline = float("inf") if unlimited else time.monotonic() + budget
 
     while not stop.is_set():
         remaining = deadline - time.monotonic()
@@ -413,7 +494,11 @@ async def _watch_ip_ban(config: Config, state: AppState, stop: asyncio.Event, *,
             return False
 
         probe_no += 1
-        report = await _run_netcheck(config, state, with_egress_ip=False)
+        # Jede n-te Probe misst die Ausgangs-IP mit: Ändert sie sich innerhalb
+        # des Containers, loggt _run_netcheck das — die offene Frage „würfelt
+        # Render überhaupt?" beantwortet sich damit von selbst.
+        with_ip = bool(recheck_every) and probe_no % recheck_every == 0
+        report = await _run_netcheck(config, state, with_egress_ip=with_ip)
         if report.discord_reachable:
             log.info(
                 "✅ discord.com ist wieder erreichbar (Probe %d in Beobachtung %d) — "
@@ -450,21 +535,58 @@ async def _give_up_on_ip(config: Config, state: AppState, stop: asyncio.Event, *
     Adresse aus dem geteilten Ausgangs-Bereich. Ohne diese Option wird einfach
     weiter probiert.
     """
-    if config.restart_on_ip_ban and config.ban_watch_seconds > 0 and not stop.is_set():
+    if stop.is_set():
+        return  # Shutdown läuft — keine Entscheidung mehr nötig
+    ledger = _restart_ledger(state)
+    restart_enabled = config.restart_on_ip_ban and config.ban_watch_seconds > 0
+
+    if restart_enabled and ledger.exhausted(config.restart_max_cycles):
+        # ── Limit erreicht: aufhören zu würfeln, klar sagen, woran es liegt ──
+        verdict = _platform_gave_up_text(config, ledger)
+        if state.platform_verdict != verdict:
+            state.platform_verdict = verdict
+            log.critical("🛑 %s", verdict)
+            log.critical("   %s", ledger.summary(config.restart_max_cycles))
+        else:
+            log.error("🛑 Neustart-Limit weiterhin erreicht (%d Zyklen) — nur noch Proben, "
+                      "kein Neustart. Details: GET /api/diagnostics", ledger.cycles)
+        cooldown = max(120.0, config.ban_probe_interval_seconds * 4)
+        state.discord_status = "ip_blocked"
+        state.discord_last_error = (
+            f"Plattform-Limit: {ledger.cycles} Neustarts ohne Erfolg — eigene Ausgangs-IP nötig "
+            f"(VPS/Fly.io/DISCORD_PROXY). IP: {report.egress_ip or 'unbekannt'}"
+        )[:300]
+        state.discord_retry_at = iso(now_utc() + timedelta(seconds=cooldown))
+        await _sleep_or_stop(stop, cooldown)
+        return
+
+    if restart_enabled and not stop.is_set():
+        cycle = ledger.record_restart(egress_ip=report.egress_ip, cause=cause)
+        remaining = ledger.remaining(config.restart_max_cycles)
+        persistence_note = (
+            "" if ledger.saved_ok else
+            "\n   ⚠ Neustart-Zähler konnte nicht gespeichert werden — auf einem flüchtigen\n"
+            "     Dateisystem (Render Free) beginnt jeder Container wieder bei Zyklus 1."
+        )
         log.critical(
             "🔁 Ausgehende IP bleibt gesperrt (%s) — dieser Container kommt so nie\n"
             "   online. Der Prozess beendet sich gleich mit Exit-Code %d, damit\n"
-            "   Render einen FRISCHEN Container startet. Der zieht eine andere\n"
-            "   Adresse aus Renders geteiltem Ausgangs-Bereich — bei einer von\n"
-            "   anderen Mietern verbrannten IP ist das die einzig wirksame\n"
-            "   Maßnahme (und genau das rät auch der Plattform-Support).\n"
+            "   die Plattform einen FRISCHEN Container startet. Der zieht mit etwas\n"
+            "   Glück eine andere Adresse aus dem geteilten Ausgangs-Bereich.\n"
             "   Gesperrte IP : %s\n"
-            "   Dauerhaft ruhig wird es mit eigener Ausgangs-IP:\n"
-            "     · DISCORD_PROXY=http://user:pass@host:port  (z. B. QuotaGuard)\n"
-            "     · oder Hosting mit fester/dedizierter IP (VPS, Fly.io, Railway)\n"
+            "   Neustart-Zyklus %d%s · bisher gesehene IPs: %s%s\n"
+            "   Dauerhaft ruhig wird es nur mit eigener Ausgangs-IP:\n"
+            "     · kleiner VPS (deploy/docker-compose.yml) oder Fly.io (deploy/fly.toml)\n"
+            "     · oder DISCORD_PROXY=http://user:pass@host:port mit statischer IP\n"
             "   Abschalten dieses Verhaltens: RESTART_ON_IP_BAN=false",
             cause, EXIT_CODE_RESTART, report.egress_ip or "unbekannt",
+            cycle, f"/{config.restart_max_cycles}" if config.restart_max_cycles > 0 else "",
+            ", ".join(ledger.ips[-6:]) or "–", persistence_note,
         )
+        if remaining == 0:
+            log.critical("   Das war der letzte erlaubte Neustart-Zyklus (RESTART_MAX_CYCLES=%d). "
+                         "Bleibt die IP danach gesperrt, probt der Bot nur noch — ohne Neustart.",
+                         config.restart_max_cycles)
         state.restart_requested = f"ip_blocked:{cause}"
         state.discord_status = "ip_blocked"
         await _sleep_or_stop(stop, config.restart_delay_seconds)
@@ -786,6 +908,44 @@ async def _connect_bot(
         break
 
 
+def _log_restart_history(config: Config, state: AppState, report: Any) -> None:
+    """
+    Nach dem Start: Ist das ein Neustart wegen IP-Sperre? Hat er eine andere IP
+    gebracht? Das ist die Information, die im Render-Log bisher fehlte.
+    """
+    ledger = _restart_ledger(state)
+    changed = ledger.note_boot_ip(getattr(report, "egress_ip", None))
+    if ledger.cycles <= 0:
+        if ledger.stale_at_start:
+            log.info("Neustart-Buch war älter als %.0f h — Zähler beginnt bei 0.",
+                     ledger.max_age_seconds / 3600)
+        return
+    limit = f"/{config.restart_max_cycles}" if config.restart_max_cycles > 0 else ""
+    if changed is True:
+        log.warning(
+            "🔁 Dies ist Neustart-Zyklus %d%s wegen gesperrter IP. Die Ausgangs-IP hat "
+            "gewechselt (%s → %s) — die Plattform würfelt also tatsächlich. "
+            "discord.com ist jetzt %s.",
+            ledger.cycles, limit, ledger.last_ip, report.egress_ip,
+            "ERREICHBAR ✅" if getattr(report, "discord_reachable", False) else "weiterhin GESPERRT",
+        )
+    elif changed is False:
+        log.warning(
+            "🔁 Dies ist Neustart-Zyklus %d%s wegen gesperrter IP — und der Container hat "
+            "wieder DIESELBE Ausgangs-IP (%s) bekommen (%d× in Folge). Neustarts "
+            "würfeln auf dieser Plattform offenbar nicht.",
+            ledger.cycles, limit, report.egress_ip, ledger.same_ip_streak,
+        )
+    else:
+        log.warning("🔁 Dies ist Neustart-Zyklus %d%s wegen gesperrter IP (Ausgangs-IP "
+                    "diesmal nicht messbar). %s", ledger.cycles, limit,
+                    ledger.summary(config.restart_max_cycles))
+    if ledger.exhausted(config.restart_max_cycles) and not getattr(report, "discord_reachable", False):
+        verdict = _platform_gave_up_text(config, ledger)
+        state.platform_verdict = verdict  # sofort in /api/diagnostics sichtbar
+        log.critical("🛑 %s", verdict)
+
+
 async def _startup_netcheck(config: Config, state: AppState, stop: asyncio.Event) -> None:
     """
     Hintergrund-Task: einmalige Netz-Diagnose beim Start.
@@ -802,6 +962,7 @@ async def _startup_netcheck(config: Config, state: AppState, stop: asyncio.Event
     log.info("Netz-Diagnose: ermittle ausgehende IP und prüfe discord.com (ohne Token) …")
     report = await _run_netcheck(config, state)
     _log_report(report, level=logging.INFO if report.verdict == "ok" else logging.WARNING)
+    _log_restart_history(config, state, report)
     if report.ip_blocked:
         log.warning(
             "⚠ discord.com blockt diese ausgehende IP schon VOR dem ersten Login-Versuch. "
@@ -851,6 +1012,14 @@ async def amain() -> int:
                          intents=build_intents(config.enable_privileged_intents))
     state = AppState(client=client, config=config, store=store)
     client.state = state
+    # Neustart-Buch: zählt Exit-Code-3-Zyklen über Prozessgrenzen hinweg
+    # (nur mit persistentem DATA_DIR wirklich über Neustarts hinweg).
+    state.restart_ledger = RestartLedger.open(
+        config.data_dir if config.persist_sessions else None
+    )
+    if state.restart_ledger.load_error:
+        log.warning("Neustart-Buch nicht lesbar (%s) — Zähler beginnt bei 0.",
+                    state.restart_ledger.load_error)
 
     app = build_app(state)
     runner: Optional[Any] = None

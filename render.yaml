@@ -16,6 +16,10 @@ services:
     name: aidiscordservereinrichten
     runtime: docker
     plan: free
+    # Greift NUR bei Neuanlage über das Blueprint! Ein bestehender Service
+    # bleibt in seiner Region (Render-Default: Oregon — dessen Free-Pool ist
+    # bei Cloudflare/Discord notorisch gesperrt). Umzug: Service löschen →
+    # Blueprint neu anwenden → Settings → Region prüfen → /api/diagnostics.
     region: frankfurt
     branch: main
     dockerfilePath: ./Dockerfile
@@ -63,6 +67,16 @@ services:
         value: "600"
       - key: RESTART_ON_IP_BAN
         value: "true"
+      # Meldet Cloudflare Retry-After > 600 s: Fenster auf 90 s verkürzen, dann
+      # neu starten (mehr IP-Würfe pro Stunde). Nach 5 erfolglosen Zyklen hört
+      # der Bot auf zu würfeln und sagt klar: Plattform kommt nicht durch →
+      # eigene Ausgangs-IP (README „Betrieb auf einem eigenen Server").
+      # Hinweis: Auf Render Free ist das Dateisystem flüchtig, der Zyklus-
+      # Zähler beginnt daher bei jedem Container neu.
+      - key: BAN_FAST_RESTART_ABOVE_SECONDS
+        value: "600"
+      - key: RESTART_MAX_CYCLES
+        value: "5"
       # Dauerhafte Lösung: eigener HTTP-Proxy mit statischer IP (REST + Gateway).
       # Leer lassen = direkte Verbindung. Wird im Deploy-Wizard abgefragt,
       # weil die URL Zugangsdaten enthalten kann.

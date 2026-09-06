@@ -16,16 +16,17 @@
 
 1. [Wie es funktioniert](#wie-es-funktioniert)
 2. [Schnellstart (≈ 15 Minuten)](#schnellstart)
-3. [Der `/connect`-Command](#der-connect-command)
-4. [Sicherheitsmodell](#sicherheitsmodell)
-5. [Die REST-API](#die-rest-api)
-6. [Die Console](#die-console)
-7. [UptimeRobot — Bot dauerhaft online halten](#uptimerobot)
-8. [Konfiguration](#konfiguration)
-9. [Lokal entwickeln](#lokal-entwickeln)
-10. [Tests](#tests)
-11. [Fehlerbehebung](#fehlerbehebung)
-12. [Projektstruktur](#projektstruktur)
+3. [Betrieb auf einem eigenen Server (VPS / Fly.io / Proxy)](#betrieb-auf-einem-eigenen-server)
+4. [Der `/connect`-Command](#der-connect-command)
+5. [Sicherheitsmodell](#sicherheitsmodell)
+6. [Die REST-API](#die-rest-api)
+7. [Die Console](#die-console)
+8. [UptimeRobot — Bot dauerhaft online halten](#uptimerobot)
+9. [Konfiguration](#konfiguration)
+10. [Lokal entwickeln](#lokal-entwickeln)
+11. [Tests](#tests)
+12. [Fehlerbehebung](#fehlerbehebung)
+13. [Projektstruktur](#projektstruktur)
 
 ---
 
@@ -128,10 +129,161 @@ Nach dem Deploy steht im Render-Log:
   · Console     : https://…/console
 ```
 
+> **⚠ Render Free und Discord — bitte vorher lesen.** Auf Render Free teilt sich
+> der Bot die **ausgehende IP** mit allen anderen Free-Diensten der Region
+> (Default: Oregon). Sperrt Cloudflare diesen Pool für `discord.com` (HTTP 429,
+> *Error 1015*), kommt **kein** Bot aus dem Pool mehr rein — der Code ist dann
+> völlig unschuldig. Gemessener Fall (2026-09-06): IP `74.220.48.143`,
+> Cloudflare-Ray `…-PDX`, `Retry-After 8034 s`. Bots, die schon eingeloggt
+> *waren*, laufen dabei weiter (bestehende Gateway-Session, `RESUME`); nur
+> **neue Logins** scheitern. Deshalb kann ein Bot „seit Monaten laufen", während
+> ein neuer nie online kommt.
+>
+> Der Bot erkennt das selbst (`GET /api/diagnostics` → `"verdict": "ip_blocked"`),
+> probt tokenlos weiter, startet sich bis zu `RESTART_MAX_CYCLES`-mal neu
+> und sagt dann klar, dass die Plattform nicht durchkommt. **Zuverlässig** läuft
+> er nur mit eigener Ausgangs-IP → [Betrieb auf einem eigenen Server](#betrieb-auf-einem-eigenen-server).
+> Kostenloser Versuch davor: Service **neu in Frankfurt** anlegen (EU-Pool ist
+> weniger bot-lastig) — siehe [Fehlerbehebung](#fehlerbehebung).
+
 ### 4. Loslegen
 
 Auf Discord `/connect` ausführen → Prompt kopieren → bei Arena AI einfügen →
 sagen, was die KI bauen soll. Fertig.
+
+---
+
+## Betrieb auf einem eigenen Server
+
+**Wann:** `GET /api/diagnostics` zeigt `"verdict": "ip_blocked"` und der Bot
+kommt auf Render nicht online (oder `platform_verdict` ist gesetzt). Dann ist
+die **ausgehende IP** das Problem — und die einzige zuverlässige Lösung ist eine
+eigene. Alles in diesem Abschnitt nutzt das **unveränderte** `Dockerfile` und
+dieselben Umgebungsvariablen wie auf Render (`PORT`, `HOST`, `PUBLIC_URL`,
+`DATA_DIR`).
+
+| | Option 1 · **VPS** (empfohlen) | Option 2 · **Fly.io** | Option 3 · **Render + Proxy** |
+| --- | --- | --- | --- |
+| Kosten | ≈ 4 €/Monat (Hetzner CX22/CAX11) | ≈ 3–4 $/Monat | VPS ≈ 4 €/Monat *oder* QuotaGuard ab 19 $/Monat |
+| Eigene IP | ✅ dedizierte IPv4 | ✅ pro Maschine | ✅ Proxy-IP |
+| Spin-down / UptimeRobot | ❌ nicht nötig | ❌ nicht nötig (`auto_stop = off`) | ⚠ weiterhin nötig |
+| Sessions überleben Neustart | ✅ Volume | ✅ Volume | ❌ (Render Free) |
+| Aufwand | 15 min, Server-Grundkenntnisse | 10 min, kein Server | 10 min + Render-Env |
+| Dateien | [`deploy/docker-compose.yml`](deploy/docker-compose.yml), [`deploy/relay.service`](deploy/relay.service) | [`deploy/fly.toml`](deploy/fly.toml) | [`deploy/proxy/`](deploy/proxy/) |
+
+**Nicht** sinnvoll: Renders „Dedicated IPs" (Pro-Workspace, ~100 $/Monat), ein
+bezahlter Render-Plan allein (bleibt ein *geteilter* CIDR-Bereich), Residential-/
+Rotating-Proxies (ToS-Grauzone) und jede Form von Cloudflare-Umgehung
+(Challenge-Solver, gefälschte Header) — das endet mit einem Account-Bann.
+
+### Option 1 — Kleiner VPS mit Docker (≈ 15 Minuten)
+
+**Du brauchst:** einen VPS mit Debian 12 / Ubuntu 22.04+ (Hetzner CX22 ≈ 4 €/Monat,
+Standort Falkenstein/Nürnberg), Root-Zugang per SSH, optional eine (Sub-)Domain.
+
+```bash
+# 1) Auf dem Server: Docker installieren (einmalig, ~1 Minute)
+curl -fsSL https://get.docker.com | sh
+
+# 2) Repo holen
+git clone https://github.com/mertastudios/AIDiscordServerEinrichten.git
+cd AIDiscordServerEinrichten/deploy
+
+# 3) Konfiguration: Token + öffentliche URL eintragen
+cp relay.env.example relay.env
+nano relay.env          # DISCORD_BOT_TOKEN=…   PUBLIC_URL=…   RELAY_DOMAIN=…
+
+# 4) Starten (baut das Image aus dem vorhandenen Dockerfile)
+docker compose up -d --build
+
+# 5) Zuschauen, bis „ist ONLINE" erscheint (Strg+C beendet nur die Anzeige)
+docker compose logs -f relay
+```
+
+**Domain oder keine Domain?**
+
+- **Mit Domain (empfohlen):** DNS-A-Record `relay.deine-domain.tld → Server-IPv4`
+  anlegen, **bevor** du startest. `RELAY_DOMAIN=relay.deine-domain.tld` und
+  `PUBLIC_URL=https://relay.deine-domain.tld` in `relay.env`. Der mitgelieferte
+  Caddy holt das Let's-Encrypt-Zertifikat automatisch; Ports 80/443 müssen offen
+  sein (`ufw allow 80,443/tcp`).
+- **Ohne Domain:** In `docker-compose.yml` den `caddy`-Dienst löschen, beim
+  `relay`-Dienst `"127.0.0.1:8080:8080"` durch `"8080:8080"` ersetzen,
+  `PUBLIC_URL=http://<Server-IPv4>:8080` setzen, `ufw allow 8080/tcp`. Funktioniert,
+  aber ohne TLS — der Session-Token geht dann unverschlüsselt durchs Netz.
+
+**Prüfen (vom Laptop aus):**
+
+```bash
+curl -s https://relay.deine-domain.tld/api/diagnostics | python3 -m json.tool | head -20
+#  → "verdict": "ok",  "discord_reachable": true,  "egress_ip": "<deine VPS-IP>"
+curl -s https://relay.deine-domain.tld/api/health | grep -o '"bot":"[a-z]*"'
+#  → "bot":"connected"
+```
+
+Dann auf Discord `/connect` — der Prompt enthält jetzt deine VPS-URL.
+
+**Betrieb:** Sessions und das Neustart-Buch liegen im Docker-Volume `relay-data`
+und überleben `docker compose restart`, Server-Reboots und Updates.
+`restart: unless-stopped` startet den Container nach jedem Ende neu.
+Update: `git pull && docker compose up -d --build`. Logs: `docker compose logs -f relay`.
+Danach den Render-Service **löschen oder pausieren** — zwei Instanzen mit demselben
+Token stören sich gegenseitig.
+
+**Ohne Docker (systemd):** [`deploy/relay.service`](deploy/relay.service) enthält
+im Kopf die komplette Einrichtung (venv unter `/opt/adse-relay`, Daten in
+`/var/lib/adse-relay`, Härtung, `Restart=always`).
+
+### Option 2 — Fly.io (kein Server zu verwalten)
+
+```bash
+curl -L https://fly.io/install.sh | sh                      # flyctl installieren
+fly auth signup                                              # oder: fly auth login
+cd AIDiscordServerEinrichten && cp deploy/fly.toml ./fly.toml
+fly launch --no-deploy --copy-config --name adse-relay --region fra   # Namen frei wählen
+fly volumes create relay_data --region fra --size 1
+fly secrets set DISCORD_BOT_TOKEN=DEIN_TOKEN PUBLIC_URL=https://adse-relay.fly.dev
+fly deploy
+fly logs                                                     # „ist ONLINE" abwarten
+```
+
+`fly.toml` setzt `auto_stop_machines = "off"` (kein Spin-down), Region `fra`,
+ein 1-GB-Volume für `DATA_DIR` und den Healthcheck auf `/api/health`.
+Prüfen: `curl -s https://adse-relay.fly.dev/api/diagnostics`.
+
+### Option 3 — Render behalten, Discord über eigenen Proxy
+
+Nur wenn Render aus anderen Gründen bleiben soll. Der Bot läuft weiter auf
+Render, aber **alle** Discord-Verbindungen (REST + Gateway) gehen über einen
+authentifizierten Squid-Proxy auf deinem VPS. discord.py 2.7 reicht `DISCORD_PROXY`
+an beides weiter; aiohttp kann dabei nur `http://`/`https://`-Proxys (kein SOCKS5).
+
+```bash
+# Auf dem VPS
+curl -fsSL https://get.docker.com | sh
+git clone https://github.com/mertastudios/AIDiscordServerEinrichten.git
+cd AIDiscordServerEinrichten/deploy/proxy
+export PROXY_USER=relay PROXY_PASS="$(openssl rand -hex 24)"; echo "$PROXY_PASS"   # merken!
+docker compose up -d && ufw allow 3128/tcp
+
+# Vom Laptop testen — muss {"url":"wss://gateway.discord.gg"} liefern:
+curl -x "http://relay:$PROXY_PASS@<VPS-IP>:3128" https://discord.com/api/v10/gateway
+```
+
+Dann in Render → *Environment*: `DISCORD_PROXY = http://relay:<PASSWORT>@<VPS-IP>:3128`
+→ **Save Changes**. Im Log erscheint `Discord-Traffic läuft über Proxy …`, in
+`/api/diagnostics` steht `"proxy"` und `"verdict": "ok"`. Der Proxy erlaubt
+ausschließlich `CONNECT :443` zu Discord-Domains (plus die IP-Dienste der
+Diagnose) — kein offenes Relay. Alternative ohne VPS: QuotaGuard Static
+(ab 19 $/Monat, dieselbe Variable).
+
+### Nach dem Umzug
+
+1. `GET /api/diagnostics` → `"verdict": "ok"`, `"discord_reachable": true`.
+2. Log: `… ist ONLINE` mit Bot-Name und Serverliste.
+3. Discord: Bot grün, `/connect` antwortet ephemeral mit Link + Token.
+4. Alten Render-Service löschen/pausieren (doppelte Logins vermeiden).
+5. UptimeRobot ist auf VPS/Fly **nicht** nötig — schadet aber auch nicht.
 
 ---
 
@@ -330,6 +482,13 @@ antwortet dann mit einem JSON-404.
 Auf Render Free schläft ein Web Service nach 15 Minuten ohne Anfrage ein — und
 mit ihm der Bot. Ein externer Ping hält ihn wach.
 
+**Warum das mehr als Kosmetik ist:** Jeder Wake-up ist ein **neuer Discord-Login**
+über Renders geteilte Ausgangs-IP — und damit ein neues Risiko, in eine
+Cloudflare-Sperre zu laufen (siehe [Fehlerbehebung](#fehlerbehebung)). Ein Bot,
+der einmal drin ist, hält seine Gateway-Session per `RESUME` auch durch Sperren
+hindurch — solange er nicht einschläft. Auf einem eigenen Server oder Fly.io
+entfällt das Problem komplett.
+
 **Ziel-URL:**
 
 ```
@@ -406,6 +565,10 @@ Eine kommentierte Vorlage liegt in [`.env.example`](.env.example).
 | `BAN_WATCH_SECONDS` | `600` | So lange wird die Sperre beobachtet, bevor der Container neu gestartet wird. `0` = nie. |
 | `RESTART_ON_IP_BAN` | `true` | Bei dauerhaft gesperrter IP: Prozess beenden (Exit-Code 3) → Render startet neu → neue IP. |
 | `RESTART_DELAY_SECONDS` | `30` | Pause vor diesem bewussten Neustart. |
+| `RESTART_MAX_CYCLES` | `5` | So viele Neustart-Zyklen hintereinander, dann nur noch proben + klares Urteil in Log und `/api/diagnostics`. Zähler in `DATA_DIR/restart_ledger.json` (überlebt Neustarts nur mit persistentem Volume). `0` = unbegrenzt. |
+| `BAN_FAST_RESTART_ABOVE_SECONDS` | `600` | Meldet Cloudflare ein `Retry-After` darüber (und über `BAN_WATCH_SECONDS`), wird das Fenster auf `BAN_FAST_RESTART_WATCH_SECONDS` verkürzt → mehr IP-Würfe pro Stunde. `0` = aus. |
+| `BAN_FAST_RESTART_WATCH_SECONDS` | `90` | Verkürztes Beobachtungsfenster im Schnell-Neustart-Fall (3 Proben à 30 s). |
+| `BAN_EGRESS_RECHECK_EVERY` | `5` | Jede n-te Probe misst die Ausgangs-IP neu; ein Wechsel wird geloggt und in `/api/diagnostics` gezählt. `0` = nur beim Start. |
 | `LOGIN_RETRY_BASE_SECONDS` | `15` | Basis des Backoffs nach anderen Login-Fehlern. |
 | `LOGIN_RETRY_MAX_SECONDS` | `600` | Obergrenze des Backoffs. |
 | `FATAL_RETRY_SECONDS` | `300` | Abstand nach fatalen Fehlern (ungültiges Token, Gateway 4004 …). |
@@ -450,11 +613,11 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 199 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 203 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
-python scripts/login_recovery_test.py # 72 Prüfungen zum Login/Rate-Limit-Verhalten
+python scripts/login_recovery_test.py # 130 Prüfungen zum Login/Rate-Limit-Verhalten
 python -m bot.netcheck                # echte Netz-Diagnose (IP + discord.com)
 ```
 
@@ -489,6 +652,9 @@ die Discord-Antworten — läuft also in Millisekunden, ohne Netzwerk und ohne T
 | IP-Sperre hebt sich | tokenlose Proben alle 30 s, danach **sofort** neuer Login |
 | IP bleibt gesperrt | nach `BAN_WATCH_SECONDS` → `RestartRequested` (Exit-Code 3) |
 | `RESTART_ON_IP_BAN=false` | unbegrenzt weiter probieren, kein Prozess-Exit |
+| `Retry-After 8034 s` (der gemessene Render-Fall) | Fenster auf 90 s verkürzt, dann Neustart — nicht 10 min in eine 2-h-Sperre proben |
+| 5 Neustarts ohne Erfolg (Buch auf Platte) | kein weiterer Neustart, `platform_verdict` gesetzt, weiter proben |
+| Ausgangs-IP wechselt innerhalb eines Prozesses | wird erkannt, gezählt und geloggt |
 | IP frei, Login trotzdem 429 | Token-Problem: lange warten, **kein** Container-Neustart |
 | Discord-429 mit `Via`-Header | `Retry-After` wird gedeckelt — nie wieder 1800 s blind schlafen |
 | HTTP 5xx mehrfach | Backoff eskaliert (der Fehlerzähler verfällt nicht mehr) |
@@ -566,31 +732,52 @@ ist `verdict`:
    10 Minuten = 0,2 % von Discords 10.000er-Limit) und loggt sich **sofort**
    ein, sobald die Sperre fällt. Blind 30 Minuten zu schlafen — wie es eine
    frühere Version tat — verpasst genau dieses Fenster.
-3. Bleibt die IP `BAN_WATCH_SECONDS` (10 min) lang gesperrt, ist sie faktisch
-   verbrannt. Dann beendet sich der Prozess mit **Exit-Code 3**, Render startet
-   einen frischen Container, und der zieht eine andere Adresse aus Renders
-   geteiltem Ausgangs-Bereich. Das ist exakt die Empfehlung, die der
-   Plattform-Support bei diesem Fehler gibt: neu starten, bis man eine nicht
-   gesperrte IP erwischt. Im Log steht vor jedem Neustart die gesperrte IP.
-4. `GET /api/health` zeigt laufend `discord_status` (`ip_blocked`, `rate_limited`,
-   `network_error`, `connecting`, `online`), `egress_ip`, `discord_reachable`
-   und `discord_retry_at`.
+3. Bleibt die IP `BAN_WATCH_SECONDS` (10 min) lang gesperrt — oder meldet
+   Cloudflare gleich ein `Retry-After` über `BAN_FAST_RESTART_ABOVE_SECONDS`
+   (dann nur 90 s) — beendet sich der Prozess mit **Exit-Code 3**. Render
+   startet einen frischen Container, der *vielleicht* eine andere Adresse aus
+   dem geteilten Ausgangs-Bereich zieht. Im Log steht vor jedem Neustart die
+   gesperrte IP, nach jedem Neustart, ob sie gewechselt hat.
+4. Nach `RESTART_MAX_CYCLES` (5) erfolglosen Zyklen hört er auf zu würfeln,
+   probt nur noch und schreibt ein klares Urteil in Log und
+   `/api/diagnostics` (`platform_verdict`): entweder *„jeder Neustart lieferte
+   dieselbe IP"* oder *„n verschiedene IPs, alle gesperrt"*. Beides heißt:
+   diese Plattform kommt nicht durch → eigene Ausgangs-IP. (Auf Render Free
+   ist das Dateisystem flüchtig — der Zähler beginnt dort bei jedem Container
+   neu; das Urteil siehst du zuverlässig auf VPS/Fly oder mit Render-Disk.)
+5. `GET /api/health` zeigt laufend `discord_status` (`ip_blocked`, `rate_limited`,
+   `network_error`, `connecting`, `online`), `egress_ip`, `discord_reachable`,
+   `restarts` und `discord_retry_at`. `GET /api/diagnostics` zusätzlich alle
+   gesehenen Ausgangs-IPs, das Neustart-Buch und konkrete nächste Schritte.
 
-**Manuell eingreifen musst du nur, wenn es nicht von selbst weggeht:**
+**„Aber meine anderen Bots auf Render laufen doch!"** — Ja, und das passt
+zusammen: Eine Cloudflare-Sperre blockt **neue REST-Logins**, killt aber keine
+**bestehende** Gateway-Verbindung. Bots, die reingekommen sind, als der Pool
+gerade sauber war, laufen per `RESUME` wochenlang weiter. Ein neuer Bot braucht
+den Login *jetzt* — und jetzt ist der Pool dicht. Genau deshalb muss der
+Bot, sobald er einmal drin ist, den Login nie wieder verlieren (UptimeRobot
+gegen Spin-down, keine unnötigen Deploys).
 
+**Manuell eingreifen musst du, wenn es nicht von selbst weggeht:**
+
+- **Kostenloser Versuch — Service neu in Frankfurt anlegen.** `region: frankfurt`
+  in `render.yaml` greift nur bei **Neuanlage**; ein bestehender Service bleibt
+  in Oregon (Render kann Regionen nicht umziehen). Also: alten Service im
+  Dashboard löschen → *New + → Blueprint* → Repo wählen → Token eintragen →
+  *Apply* → im Service unter *Settings* prüfen, dass **Region: Frankfurt** steht
+  → nach dem Deploy `GET /api/diagnostics`: `egress_ip` sollte eine EU-Adresse
+  sein und `verdict` idealerweise `ok`. Der Frankfurt-Pool ist deutlich weniger
+  bot-lastig als Oregon — eine Garantie ist das nicht.
+- **Zuverlässige Lösung — eigene Ausgangs-IP** (≈ 4 €/Monat):
+  [Betrieb auf einem eigenen Server](#betrieb-auf-einem-eigenen-server) —
+  VPS (`deploy/docker-compose.yml`), Fly.io (`deploy/fly.toml`) oder Render +
+  eigener Proxy (`deploy/proxy/`, Variable `DISCORD_PROXY`).
 - **Doppelte Prozesse ausschließen** — häufigste *selbstgemachte* Ursache:
   derselbe Token läuft lokal **und** auf Render, oder ein zweiter Render-Service
   nutzt dasselbe Token. Alles außer einem stoppen. `numInstances` muss `1` sein.
-- **Eigene Ausgangs-IP** (die dauerhafte Lösung, ~5 Minuten):
-  ```
-  DISCORD_PROXY=http://user:pass@host:port      # z. B. QuotaGuard Static
-  DISCORD_PROXY_USER=…   DISCORD_PROXY_PASSWORD=…
-  ```
-  discord.py schickt dann REST **und** Gateway über diesen Proxy. Der Bot bleibt
-  auf Render Free, aber Discord sieht nur noch die saubere Proxy-IP.
-- **Anderer Hoster:** VPS, Fly.io oder Railway mit dedizierter/fester IP. Ein
-  bezahlter Render-Plan allein ändert nichts — Renders Ausgangs-IPs bleiben
-  auch dort geteilte CIDR-Bereiche (dedizierte IPs sind ein Workspace-Add-on).
+- **Kein Ausweg:** bezahlter Render-Plan allein (bleibt ein geteilter
+  CIDR-Bereich), Renders Dedicated IPs (~100 $/Monat), Rotating-Proxies oder
+  Cloudflare-Umgehung (Account-Bann).
 - **Neustart abschalten**, falls du lieber selbst deployen willst:
   `RESTART_ON_IP_BAN=false` (dann probt der Bot unbegrenzt weiter).
 
@@ -639,6 +826,7 @@ AIDiscordServerEinrichten/
 │   ├── discord_bot.py       /connect, /status, /revoke, Buttons, Rechteprüfungen
 │   ├── config.py            Umgebungsvariablen, Validierung, maskierte Ausgabe
 │   ├── netcheck.py          Netz-Diagnose: ausgehende IP + discord.com-Probe
+│   ├── restarts.py          Neustart-Buch: Zyklen + gesehene IPs über Prozessgrenzen
 │   ├── sessions.py          Token erzeugen, hashen, verifizieren, widerrufen
 │   ├── prompt.py            Die drei Prompt-Varianten für Arena AI
 │   ├── serializers.py       discord.py-Objekte → JSON-sichere Dicts
@@ -665,9 +853,16 @@ AIDiscordServerEinrichten/
 │           ├── events.py    Scheduled Events
 │           └── setup.py     Der Setup-Wizard + fünf Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        199 Prüfungen ohne Discord-Verbindung
-│   ├── login_recovery_test.py 72 Prüfungen zum 429/1015-Verhalten (Fake-Uhr)
+│   ├── smoke_test.py        203 Prüfungen ohne Discord-Verbindung
+│   ├── login_recovery_test.py 130 Prüfungen zum 429/1015-Verhalten (Fake-Uhr)
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double
+├── deploy/
+│   ├── docker-compose.yml   VPS: Bot + Caddy (HTTPS) aus dem vorhandenen Dockerfile
+│   ├── Caddyfile            Reverse-Proxy mit Let's Encrypt
+│   ├── relay.env.example    Vorlage für Token/PUBLIC_URL auf dem Server
+│   ├── relay.service        systemd-Unit (Betrieb ohne Docker)
+│   ├── fly.toml             Fly.io (Region fra, Volume, kein Spin-down)
+│   └── proxy/               Option 3: Squid-Proxy mit statischer IP für DISCORD_PROXY
 ├── ci/
 │   ├── ci.yml               GitHub-Actions-Workflow (siehe ci/README.md)
 │   └── README.md            So wird er aktiviert
