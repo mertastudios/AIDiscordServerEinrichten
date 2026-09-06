@@ -611,7 +611,7 @@ async def get_prompt(ctx: Ctx) -> Any:
 @route(
     "POST", "/api/v1/session/regenerate", scope="read", tags=("meta",),
     summary="Neues Token erzeugen (das alte wird sofort widerrufen)",
-    body={"mode": "optional — read|write|manage|danger (Standard: bisheriger Modus)",
+    body={"mode": "optional — read|read_write (Standard: bisheriger Modus)",
           "ttl_hours": "optional — Gültigkeit in Stunden (0 = unbegrenzt)"},
     description="Praktisch, wenn ein Token versehentlich weitergegeben wurde. "
                 "Gibt das **neue Klartext-Token** zurück.",

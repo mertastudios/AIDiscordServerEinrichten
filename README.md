@@ -298,19 +298,18 @@ Der eine Command, um den es geht.
 | Option  | Werte | Standard |
 | ------- | ----- | -------- |
 | `dauer` | 1 h · 6 h · **24 h** · 3 T · 7 T · 30 T · unbegrenzt | 24 Stunden |
-| `modus` | 🔥 Voller Zugriff · 🛡️ Moderation · 🛠️ Einrichten · 👁️ Nur lesen | Voller Zugriff |
+| `modus` | ✍️ Lesen + Schreiben · 👁️ Nur lesen | Lesen + Schreiben |
 
 **Was du bekommst — und wer es sieht:**
 
 Die Antwort ist **ephemeral**. Nur du siehst sie; für alle anderen im Channel ist
 sie unsichtbar, und sie taucht in keinem Log auf.
 
-- **Nachricht 1** — Zugangsdaten als Embed: Server, Modus, Gültigkeit,
-  API-Basis-URL, Token (zusätzlich als Spoiler markiert), Console-Link
+- **Eine Nachricht** — kurz erklärt, dann der fertige Prompt im Codeblock.
+  **URL und Token stecken schon im Prompt** — den Block einmal kopieren (Discord
+  hat dafür einen Kopier-Button), bei Arena AI einfügen, fertig.
 - **Drei Buttons** — `🖥️ Console öffnen` · `🔄 Neues Token` · `⛔ Alle widerrufen`
   (persistent: funktionieren auch nach einem Render-Deploy noch)
-- **Nachricht 2** — der fertige Prompt im Codeblock zum Kopieren, plus
-  `arena-prompt.md` als Anhang mit der ausführlichen Fassung samt API-Referenz
 
 **Zwei Command-Brüder für den Notfall:**
 
@@ -346,11 +345,11 @@ Jeder abgelehnte Versuch wird im Render-Log protokolliert.
 | **Maskierte Logs** | `config.masked()` kürzt den Token auf `inval…test (28 Zeichen)`. Log-Screenshots sind damit unkritisch. |
 | **CORS einschränkbar** | `ALLOWED_ORIGIN` statt `*`, wenn du es enger willst. |
 
-> **Was das Modell bewusst *nicht* leistet:** Im Modus `danger` hat die KI
-> Administrator-Macht über deinen Server — genau das ist der Zweck. Sie kann
-> Kanäle löschen, Mitglieder bannen und Einstellungen ändern. Nutze `🛠️
-> Einrichten` oder `👁️ Nur lesen`, wenn du erst zuschauen willst, und entzieh
-> den Zugriff mit `/revoke`, sobald du fertig bist.
+> **Was das Modell bewusst *nicht* leistet:** Im Modus ✍️ **Lesen + Schreiben**
+> hat die KI Administrator-Macht über deinen Server — genau das ist der Zweck.
+> Sie kann Kanäle löschen, Mitglieder bannen und Einstellungen ändern. Nutze
+> 👁️ **Nur lesen**, wenn du erst zuschauen willst, und entzieh den Zugriff mit
+> `/revoke`, sobald du fertig bist.
 
 ---
 
@@ -629,7 +628,7 @@ Discord-Client ([`scripts/_fake_discord.py`](scripts/_fake_discord.py)) und prü
 | `public` | Healthcheck, Landingpage, Console, robots.txt, Capabilities ohne Token |
 | `auth` | 401-Pfade, Token-Format, Hash-Speicherung, `/me`, Prompt-Varianten |
 | `read` | Guild, Kanalbaum, Rollen, Mitglieder, Suche, Permissions, Snapshot, Audit-Log |
-| `scopes` | `read` darf nicht schreiben, `write` darf nicht moderieren |
+| `scopes` | `read` darf nicht schreiben, `read_write` darf alles · Legacy-Modi werden gemappt |
 | `errors` | JSON statt HTML bei 404/405, ungültiges JSON, fremder Server |
 | `setup` | Alle fünf Vorlagen validieren; fehlerhafte Pläne werden abgewiesen |
 | `lifecycle` | Token erneuern, widerrufen, Ablauf |

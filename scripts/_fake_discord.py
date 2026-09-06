@@ -683,7 +683,7 @@ class FakeGuild:
 
         return _gen()
 
-    async def bans(self, **_kwargs: Any):  # noqa: ANN201
+    def bans(self, **_kwargs: Any):  # noqa: ANN201
         async def _gen():
             return
             yield  # pragma: no cover

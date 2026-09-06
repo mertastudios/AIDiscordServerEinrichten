@@ -385,17 +385,20 @@ async def t_scopes(h: Harness) -> None:
     check("403 verweist auf /connect",
           "connect" in (blocked["json"].get("error", {}).get("hint") or "").lower())
 
-    await h.new_token("write", "write")
-    api_w = h.api("write")
-    check("write-Scope darf keine Banns lesen → 403",
-          (await api_w.call("GET", "/api/v1/bans"))["status"] == 403)
+    await h.new_token("read_write", "read_write")
+    api_rw = h.api("read_write")
+    check("read_write-Modus darf moderieren (Banns lesen → 200)",
+          (await api_rw.call("GET", "/api/v1/bans"))["status"] == 200)
 
-    for key, expected_scope in (("read", "read"), ("write", "write"), ("danger", "danger")):
+    for key, expected_scope in (("read", "read"), ("read_write", "danger")):
         session = h.store.verify(h.tokens[key])
         check(f"Session '{key}' hat Scope '{expected_scope}'", session.scope == expected_scope)
 
-    from bot.sessions import MODES
-    check("Alle vier Modi definiert", set(MODES) == {"read", "write", "manage", "danger"})
+    from bot.sessions import MODES, normalize_mode
+    check("Genau zwei Modi definiert", set(MODES) == {"read", "read_write"})
+    check("Legacy-Modi werden auf 'Lesen + Schreiben' gemappt",
+          normalize_mode("danger") == "read_write" and normalize_mode("manage") == "read_write"
+          and normalize_mode("write") == "read_write" and normalize_mode("read") == "read")
     for mode, info in MODES.items():
         check(f"Modus '{mode}' hat Label+Emoji+Beschreibung",
               bool(info.get("label")) and bool(info.get("emoji")) and bool(info.get("description")))
@@ -634,8 +637,8 @@ async def t_session_limit(h: Harness) -> None:
         guild_id=GUILD_ID, guild_name="Smoke-Test Server", created_by=USER_ID,
         created_by_name="Tester", mode="gibts_nicht", ttl_hours=1,
     )
-    check("Unbekannter Modus fällt auf 'danger' zurück", bad_mode.mode == "danger",
-          bad_mode.mode)
+    check("Unbekannter Modus fällt auf 'Lesen + Schreiben' zurück",
+          bad_mode.mode == "read_write", bad_mode.mode)
 
 
 async def t_security(h: Harness) -> None:
