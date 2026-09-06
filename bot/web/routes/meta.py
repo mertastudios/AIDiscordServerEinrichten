@@ -90,6 +90,10 @@ async def health(ctx: Ctx) -> Dict[str, Any]:
         "login_attempts": getattr(state, "login_attempts", 0),
         "login_failures": getattr(state, "login_failures", 0),
         "restart_requested": getattr(state, "restart_requested", None),
+        # Neustart-Zyklen wegen IP-Sperre (Exit-Code 3) seit dem letzten
+        # erfolgreichen Login — und ob die Plattform aufgegeben wurde.
+        "restarts": getattr(getattr(state, "restart_ledger", None), "cycles", 0),
+        "platform_verdict": getattr(state, "platform_verdict", None),
         "bot_user": user.name if user else None,
         "bot_id": sf(user.id) if user else None,
         "guilds": len(client.guilds) if client is not None else 0,
@@ -148,20 +152,44 @@ async def diagnostics(ctx: Ctx) -> Dict[str, Any]:
     report = state.net_report
     net = report.to_dict() if report is not None else {"verdict": "not_checked"}
     verdict = net.get("verdict", "unknown")
+    ledger = getattr(state, "restart_ledger", None)
+    max_cycles = int(getattr(config, "restart_max_cycles", 0) or 0)
+    restarts = ledger.to_dict(max_cycles) if ledger is not None else {"cycles": 0}
+    platform_verdict = getattr(state, "platform_verdict", None)
+    ips_seen = list(getattr(state, "egress_ips_seen", []) or [])
 
     steps: List[str] = []
-    if verdict == VERDICT_IP_BLOCKED:
+    if verdict == VERDICT_IP_BLOCKED and platform_verdict:
+        steps = [
+            "STOPP: Diese Plattform kommt nicht zu Discord durch. "
+            f"{restarts.get('cycles', 0)} Neustarts haben keine freie Ausgangs-IP "
+            "gebracht — der Bot würfelt nicht mehr, sondern probt nur noch.",
+            "Option 1 (empfohlen): kleiner VPS mit eigener IPv4 — deploy/docker-compose.yml, "
+            "Anleitung im README unter 'Betrieb auf einem eigenen Server'.",
+            "Option 2: Fly.io (deploy/fly.toml, Region fra/ams).",
+            "Option 3: Render behalten und DISCORD_PROXY auf einen Proxy mit statischer "
+            "IP setzen (deploy/proxy/, README 'Proxy mit statischer IP').",
+            "Der Bot loggt sich weiterhin automatisch ein, falls die Sperre doch "
+            "noch fällt — nur ohne weitere Neustarts.",
+        ]
+    elif verdict == VERDICT_IP_BLOCKED:
         steps = [
             "Nichts am Bot ändern — die AUSGEHENDE IP ist bei Cloudflare gesperrt "
             "(Error 1015). Der Bot probt automatisch weiter und loggt sich sofort "
             "ein, sobald die Sperre fällt.",
             "Nicht manuell neu deployen, während der Bot probt: Das setzt die "
             "Wartezeit zurück. Nach Ablauf des Beobachtungsfensters "
-            f"({int(config.ban_watch_seconds)} s) startet er sich selbst neu und "
-            "zieht dabei meist eine andere IP.",
-            "Dauerhaft ruhig wird es nur mit eigener Ausgangs-IP: "
-            "DISCORD_PROXY setzen (z. B. QuotaGuard Static) oder auf einen Host "
-            "mit dedizierter/fester IP wechseln (VPS, Fly.io, Railway).",
+            f"({int(config.ban_watch_seconds)} s) — oder sofort, wenn Cloudflare ein "
+            f"Retry-After > {int(config.ban_fast_restart_above_seconds)} s meldet — "
+            "startet er sich selbst neu und zieht dabei hoffentlich eine andere IP.",
+            f"Neustart-Zyklus {restarts.get('cycles', 0)}"
+            + (f" von {max_cycles}" if max_cycles else "")
+            + f"; gesehene Ausgangs-IPs: {', '.join(restarts.get('ips_seen') or ips_seen) or 'nur die aktuelle'}. "
+            "Bleibt es immer dieselbe IP, würfelt die Plattform nicht — dann hilft nur "
+            "eine eigene Ausgangs-IP.",
+            "Dauerhaft ruhig wird es nur mit eigener Ausgangs-IP: kleiner VPS "
+            "(deploy/docker-compose.yml), Fly.io (deploy/fly.toml) oder DISCORD_PROXY "
+            "mit statischer IP.",
             "Prüfen, ob dasselbe Token noch woanders läuft (lokal, zweiter "
             "Render-Service): doppelte Logins erzeugen genau diese Sperren.",
         ]
@@ -193,6 +221,14 @@ async def diagnostics(ctx: Ctx) -> Dict[str, Any]:
         "discord_reachable": net.get("discord_reachable"),
         "proxy": net.get("proxy"),
         "discord_probe": net.get("discord_probe"),
+        # Ausgangs-IPs, die DIESER Prozess gemessen hat — ändert sich die IP
+        # innerhalb eines Containers, steht es hier (und im Log).
+        "egress_ips_seen_this_process": ips_seen,
+        "egress_ip_changes_this_process": getattr(state, "egress_ip_changes", 0),
+        # Neustart-Buch: Zyklen wegen IP-Sperre, gesehene IPs, Limit.
+        "restarts": restarts,
+        # Gesetzt, sobald das Neustart-Limit erreicht ist: Klartext-Urteil.
+        "platform_verdict": platform_verdict,
         "login": {
             "status": getattr(state, "discord_status", "connecting"),
             "last_error": getattr(state, "discord_last_error", None),
@@ -208,6 +244,11 @@ async def diagnostics(ctx: Ctx) -> Dict[str, Any]:
             "ban_watch_seconds": config.ban_watch_seconds,
             "restart_on_ip_ban": config.restart_on_ip_ban,
             "restart_delay_seconds": config.restart_delay_seconds,
+            "restart_max_cycles": getattr(config, "restart_max_cycles", None),
+            "ban_fast_restart_above_seconds": getattr(config, "ban_fast_restart_above_seconds", None),
+            "ban_egress_recheck_every": getattr(config, "ban_egress_recheck_every", None),
+            "data_dir": config.data_dir,
+            "persist_sessions": config.persist_sessions,
             "login_retry_base_seconds": config.login_retry_base_seconds,
             "login_retry_max_seconds": config.login_retry_max_seconds,
             "fatal_retry_seconds": config.fatal_retry_seconds,

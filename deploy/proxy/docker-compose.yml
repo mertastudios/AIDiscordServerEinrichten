@@ -1,0 +1,54 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Option 3 — Render behalten, Discord-Traffic über einen eigenen Proxy schicken
+#
+#  Der Bot bleibt auf Render; nur die Verbindungen zu discord.com laufen über
+#  diesen HTTP-Proxy auf einem kleinen VPS mit eigener IPv4. Cloudflare sieht
+#  dann die Proxy-IP, nicht mehr Renders geteilten Pool.
+#
+#  Ehrliche Einordnung: Wer ohnehin einen VPS mietet, fährt mit
+#  deploy/docker-compose.yml (Bot komplett auf dem VPS) besser — kein Render-
+#  Spin-down, kein UptimeRobot, Sessions persistent. Diese Variante ist für
+#  den Fall, dass Render aus anderen Gründen bleiben soll.
+#
+#  Einrichtung (auf dem VPS):
+#    curl -fsSL https://get.docker.com | sh
+#    git clone https://github.com/mertastudios/AIDiscordServerEinrichten.git
+#    cd AIDiscordServerEinrichten/deploy/proxy
+#    PROXY_USER=relay PROXY_PASS="$(openssl rand -hex 24)"; echo "$PROXY_PASS"   # merken!
+#    PROXY_USER=$PROXY_USER PROXY_PASS=$PROXY_PASS docker compose up -d
+#    ufw allow 3128/tcp                       # Firewall (falls ufw aktiv)
+#
+#  Test vom Laptop aus (muss {"url":"wss://gateway.discord.gg"} liefern):
+#    curl -x http://relay:PASSWORT@<VPS-IP>:3128 https://discord.com/api/v10/gateway
+#
+#  Dann in Render → Environment:
+#    DISCORD_PROXY = http://relay:PASSWORT@<VPS-IP>:3128
+#  Save Changes → Render deployt neu → Log: „Discord-Traffic läuft über Proxy …"
+#  → GET /api/diagnostics zeigt "proxy" und "verdict": "ok".
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  proxy:
+    image: ubuntu/squid:latest
+    container_name: adse-proxy
+    restart: unless-stopped
+    ports:
+      - "3128:3128"
+    volumes:
+      - ./squid.conf:/etc/squid/squid.conf:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+    environment:
+      PROXY_USER: ${PROXY_USER:?PROXY_USER setzen}
+      PROXY_PASS: ${PROXY_PASS:?PROXY_PASS setzen}
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "squid -k check || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 256m

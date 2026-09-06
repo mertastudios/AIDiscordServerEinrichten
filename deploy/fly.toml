@@ -1,0 +1,65 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  AIDiscordServerEinrichten — Fly.io (Alternative zum eigenen VPS)
+#
+#  Fly.io-Maschinen haben eine EIGENE ausgehende IPv4 pro Region-Host (kein
+#  regionsweit geteilter NAT-Pool wie bei Render Free), Region Frankfurt/
+#  Amsterdam, kein Spin-down (auto_stop aus), persistentes Volume für Sessions.
+#  Kosten: shared-cpu-1x / 256 MB ≈ 2–4 $/Monat (+ ~0,15 $ für 1 GB Volume).
+#
+#  Einrichtung (lokal, einmalig):
+#    curl -L https://fly.io/install.sh | sh          # flyctl
+#    fly auth signup                                  # bzw. fly auth login
+#    cd AIDiscordServerEinrichten
+#    cp deploy/fly.toml ./fly.toml
+#    fly launch --no-deploy --copy-config --name adse-relay --region fra
+#    fly volumes create relay_data --region fra --size 1
+#    fly secrets set DISCORD_BOT_TOKEN=DEIN_TOKEN
+#    fly secrets set PUBLIC_URL=https://adse-relay.fly.dev     # = App-Name!
+#    fly deploy
+#    fly logs                                          # „… ist ONLINE" abwarten
+#
+#  Falls die Fly-IP gesperrt sein sollte (selten, aber möglich):
+#    fly machine restart <id>  — oder Region wechseln (ams, cdg).
+# ─────────────────────────────────────────────────────────────────────────────
+
+app = "adse-relay"                # eindeutig wählen — ergibt https://<app>.fly.dev
+primary_region = "fra"            # Frankfurt; Alternativen: ams, cdg, lhr
+
+kill_signal = "SIGTERM"           # der Bot fährt auf SIGTERM sauber herunter
+kill_timeout = 25
+
+[build]
+  dockerfile = "Dockerfile"       # das vorhandene Image, unverändert
+
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8080"
+  DATA_DIR = "/app/data"
+  LOG_LEVEL = "INFO"
+  PRIVILEGED_INTENTS = "true"
+  # Eigene IP ⇒ Neustart bringt keine andere Adresse: proben statt würfeln.
+  RESTART_ON_IP_BAN = "false"
+  BAN_WATCH_SECONDS = "0"
+  BAN_PROBE_INTERVAL_SECONDS = "30"
+
+[[mounts]]
+  source = "relay_data"           # fly volumes create relay_data --region fra --size 1
+  destination = "/app/data"       # Sessions + Neustart-Buch überleben Deploys
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"      # NIE schlafen legen — jeder Wake-up wäre ein neuer Login
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/api/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

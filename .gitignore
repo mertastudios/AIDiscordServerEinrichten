@@ -36,6 +36,10 @@ sessions.json
 .env
 .env.*
 !.env.example
+# Server-Konfiguration mit Token (deploy/relay.env) — nur die .example ist im Repo
+*.env
+!*.env.example
+deploy/relay.env
 *.token
 token.txt
 secrets.json
