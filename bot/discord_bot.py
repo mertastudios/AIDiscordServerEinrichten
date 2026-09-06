@@ -313,7 +313,7 @@ class RelayClient(discord.Client):
         ) -> None:
             """Der Haupt-Command: erzeugt Link + Token und den fertigen KI-Prompt."""
             gate = await self._guard(interaction)
-            if gate is not None:
+            if gate is None:
                 return
             guild = gate["guild"]
             member = gate["member"]
@@ -337,7 +337,7 @@ class RelayClient(discord.Client):
         @app_commands.guild_only()
         async def status(interaction: discord.Interaction) -> None:
             gate = await self._guard(interaction, require_bot_admin=False)
-            if gate is not None:
+            if gate is None:
                 return
             guild = gate["guild"]
             me = guild.me
@@ -405,7 +405,7 @@ class RelayClient(discord.Client):
         @app_commands.guild_only()
         async def revoke(interaction: discord.Interaction) -> None:
             gate = await self._guard(interaction, require_bot_admin=False)
-            if gate is not None:
+            if gate is None:
                 return
             guild = gate["guild"]
             member = gate["member"]
@@ -440,9 +440,11 @@ class RelayClient(discord.Client):
             log.info("%s hat %d Sitzung(en) auf '%s' widerrufen.", member.display_name,
                      len(revoked), guild.name)
 
-        connect.on_error = self._on_command_error  # type: ignore[assignment]
-        status.on_error = self._on_command_error  # type: ignore[assignment]
-        revoke.on_error = self._on_command_error  # type: ignore[assignment]
+        # Hinweis: pro-Command on_error ist hier NICHT nötig — discord.py ruft
+        # bei einem Fehler SOWOHL command.on_error ALS AUCH tree.on_error auf
+        # (siehe CommandTree._dispatch_error). tree.on_error ist bereits in
+        # __init__ gesetzt, daher würden diese Zuweisungen jede Fehlermeldung
+        # doppelt senden. Bewusst weggelassen.
 
         # Kein add_listener() hier: das gibt es nur auf commands.Bot, nicht auf
         # discord.Client. Button-Klicks bedient stattdessen die Methode
