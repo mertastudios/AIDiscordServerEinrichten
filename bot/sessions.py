@@ -11,7 +11,7 @@ Stattdessen erzeugt ``/connect`` ein **Sitzungs-Token**, das
 
 * nur für genau einen Server gilt (``guild_id``),
 * einen Ablaufzeitpunkt hat (TTL),
-* Berechtigungs-Stufen kennt (read → write → manage → danger),
+* genau zwei Modi kennt: **Lesen + Schreiben** oder **Nur lesen**,
 * jederzeit per Button, ``/revoke`` oder API widerrufbar ist und
 * nur als SHA-256-Hash gespeichert wird (Speicher-Dump ≠ Token-Leak).
 
@@ -44,43 +44,54 @@ __all__ = (
     "SCOPE_LEVELS",
     "SCOPE_ORDER",
     "MODES",
+    "DEFAULT_MODE",
+    "normalize_mode",
     "Session",
     "SessionStore",
     "hash_token",
     "new_token",
 )
 
-#: Berechtigungs-Stufen, aufsteigend.
+#: Berechtigungs-Stufen der API-Routen (intern, aufsteigend). Routen im
+#: Registry deklarieren, welche Stufe sie brauchen; ein Session-Scope muss
+#: mindestens so hoch sein. Die Modi oben drüber sind die einzigen zwei,
+#: die ein Nutzer wählen kann.
 SCOPE_LEVELS: Dict[str, int] = {"read": 0, "write": 1, "manage": 2, "danger": 3}
 SCOPE_ORDER: List[str] = ["read", "write", "manage", "danger"]
 
-#: Von der KI/Console verwendete, menschenlesbare Modi.
+#: Die zwei Modi, die es gibt — mehr nicht.
 MODES: Dict[str, Dict[str, Any]] = {
+    "read_write": {
+        "label": "Lesen + Schreiben",
+        "emoji": "✍️",
+        "scope": "danger",
+        "description": "Alles erlaubt: ansehen, einrichten, moderieren (Kanäle, Rollen, Nachrichten, Kick/Ban).",
+    },
     "read": {
         "label": "Nur lesen",
         "emoji": "👁️",
         "scope": "read",
         "description": "Server anschauen, nichts verändern.",
     },
-    "write": {
-        "label": "Einrichten",
-        "emoji": "🛠️",
-        "scope": "write",
-        "description": "Kanäle, Rollen, Nachrichten, Emojis, Events anlegen & bearbeiten.",
-    },
-    "manage": {
-        "label": "Moderation",
-        "emoji": "🛡️",
-        "scope": "manage",
-        "description": "Wie 'Einrichten' plus Timeout, Kick, Ban und AutoMod.",
-    },
-    "danger": {
-        "label": "Voller Zugriff",
-        "emoji": "🔥",
-        "scope": "danger",
-        "description": "Alles — inklusive Server-Einstellungen, Prune, Massenlöschung.",
-    },
 }
+
+#: Standard, wenn beim ``/connect`` kein Modus gewählt wurde.
+DEFAULT_MODE = "read_write"
+
+#: Modi älterer Versionen → aktueller Modus (für gespeicherte Sessions).
+_LEGACY_MODES: Dict[str, str] = {
+    "write": "read_write",
+    "manage": "read_write",
+    "danger": "read_write",
+}
+
+
+def normalize_mode(mode: Optional[str]) -> str:
+    """Mappt beliebige/veraltete Modus-Angaben auf einen der zwei gültigen Modi."""
+    mode = (mode or "").strip().lower()
+    if mode in MODES:
+        return mode
+    return _LEGACY_MODES.get(mode, DEFAULT_MODE)
 
 TOKEN_PREFIX = "adse_"
 
@@ -193,9 +204,10 @@ class Session:
                 return None
 
         known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
-        return cls(
+        session = cls(
             **{
-                **{k: v for k, v in data.items() if k in known and k not in
+                **{k: normalize_mode(v) if k == "mode" else v
+                   for k, v in data.items() if k in known and k not in
                    {"created_at", "expires_at", "last_used_at", "revoked_at"}},
                 "created_at": _dt(data.get("created_at")) or now_utc(),
                 "expires_at": _dt(data.get("expires_at")),
@@ -203,6 +215,10 @@ class Session:
                 "revoked_at": _dt(data.get("revoked_at")),
             }
         )
+        # Alte Modi (write/manage/danger) sauber auf die zwei aktuellen mappen;
+        # der gespeicherte Scope bleibt die echte Berechtigungsstufe.
+        session.mode = normalize_mode(session.mode)
+        return session
 
 
 @dataclass
@@ -321,7 +337,7 @@ class SessionStore:
         guild_name: str,
         created_by: int,
         created_by_name: str,
-        mode: str = "danger",
+        mode: str = DEFAULT_MODE,
         ttl_hours: Optional[float] = None,
         note: str = "",
     ) -> Tuple[Session, str]:
@@ -329,7 +345,7 @@ class SessionStore:
         Legt eine Sitzung an und gibt ``(session, plaintext_token)`` zurück.
         Das Klartext-Token wird **einmal** zurückgegeben und danach verworfen.
         """
-        mode = mode if mode in MODES else "danger"
+        mode = normalize_mode(mode)
         if ttl_hours is None:
             expires = now_utc() + self.default_ttl if self.default_ttl else None
         elif ttl_hours <= 0:

@@ -6,9 +6,10 @@ Der Discord-Teil: Slash-Commands, Buttons und Rechteprüfungen.
 1. prüft, dass **der Nutzer Administrator** ist,
 2. prüft, dass **der Bot Administrator** ist,
 3. erzeugt ein Sitzungs-Token (nur für diesen Server, mit Ablaufdatum),
-4. antwortet **ephemeral** — nur der Aufrufer sieht Link, Token und Prompt,
-5. hängt den Prompt als ``.md`` an und bietet Buttons für Console,
-   Token-Erneuerung und Widerruf.
+4. antwortet **ephemeral** mit genau einer klaren Nachricht: dem fertigen
+   Prompt für Arena AI im Codeblock — URL und Token stecken darin und werden
+   mit **einem Klick** mitkopiert (Discord-Kopierbutton am Codeblock),
+5. bietet Buttons für Console, Token-Erneuerung und Widerruf.
 
 Dazu kommen zwei Sicherheits-Commands: ``/status`` (Rechte-Check) und
 ``/revoke`` (Zugriff sofort entziehen).
@@ -16,7 +17,6 @@ Dazu kommen zwei Sicherheits-Commands: ``/status`` (Rechte-Check) und
 
 from __future__ import annotations
 
-import io
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -26,9 +26,9 @@ from discord import app_commands
 
 from . import __version__
 from .config import Config, mask_proxy_url
-from .prompt import PromptContext, long_prompt, short_prompt
-from .sessions import MODES, SessionStore
-from .util import ApiError, human_duration, iso, now_utc
+from .prompt import PromptContext, short_prompt
+from .sessions import DEFAULT_MODE, MODES, SessionStore, normalize_mode
+from .util import ApiError, human_duration, now_utc
 
 log = logging.getLogger("relay.discord")
 
@@ -39,7 +39,6 @@ ADMIN_INVITE_SCOPES = ("bot", "applications.commands")
 #: Mindestabstand zwischen zwei globalen Slash-Command-Syncs (Sekunden).
 COMMAND_SYNC_MIN_INTERVAL = 3600.0
 
-ACCENT = discord.Color.from_str("#5865F2")
 OK_COLOR = discord.Color.from_str("#2ECC71")
 WARN_COLOR = discord.Color.from_str("#F1C40F")
 ERR_COLOR = discord.Color.from_str("#E74C3C")
@@ -55,9 +54,7 @@ DURATION_CHOICES = [
 ]
 
 MODE_CHOICES = [
-    app_commands.Choice(name="🔥 Voller Zugriff — alles (Standard)", value="danger"),
-    app_commands.Choice(name="🛡️ Moderation — Einrichten + Timeout/Kick/Ban", value="manage"),
-    app_commands.Choice(name="🛠️ Einrichten — Kanäle, Rollen, Nachrichten", value="write"),
+    app_commands.Choice(name="✍️ Lesen + Schreiben — alles einrichten & moderieren (Standard)", value="read_write"),
     app_commands.Choice(name="👁️ Nur lesen — nichts verändern", value="read"),
 ]
 
@@ -309,7 +306,7 @@ class RelayClient(discord.Client):
         async def connect(
             interaction: discord.Interaction,
             dauer: float = 24.0,
-            modus: str = "danger",
+            modus: str = DEFAULT_MODE,
         ) -> None:
             """Der Haupt-Command: erzeugt Link + Token und den fertigen KI-Prompt."""
             gate = await self._guard(interaction)
@@ -544,82 +541,26 @@ class RelayClient(discord.Client):
             console_url=console_url,
         )
         short = short_prompt(prompt_ctx)
-        long_text = long_prompt(prompt_ctx)
 
-        # ── Nachricht 1: Zugangsdaten + Buttons ──────────────────────────────
-        embed = discord.Embed(
-            title="🔗 Arena-AI-Zugang freigeschaltet",
-            description=(
-                "Kopiere den Prompt unten und füge ihn bei **Arena AI** ein — "
-                "dann kann die KI diesen Server als Bot mit Administrator-Rechten "
-                "einrichten.\n\n"
-                "**Diese Nachricht sieht nur du.**"
-            ),
-            color=OK_COLOR,
-            timestamp=now_utc(),
+        # ── Antwort: EINE Nachricht — nur der Prompt, fertig zum Kopieren ────
+        mode_info = MODES.get(session.mode, {})
+        expires = session.to_public_dict()["expires_in"]
+        intro = (
+            "✅ **Fertig!** Kopiere den **kompletten Block** unten (Kopier-Button "
+            "oben rechts am Codeblock) und schicke ihn bei **Arena AI** als "
+            "Nachricht ein — **URL + Token** für die Verbindung stecken schon "
+            "im Prompt.\n"
+            f"{mode_info.get('emoji', '')} Modus: **{mode_info.get('label', session.mode)}** · "
+            f"⏳ gültig: **{expires}**\n\n"
         )
-        embed.add_field(name="🏠 Server", value=f"{guild.name}\n`{guild.id}`", inline=True)
-        embed.add_field(name="👤 Freigegeben von", value=member.mention, inline=True)
-        embed.add_field(
-            name="🛡️ Modus",
-            value=f"{MODES.get(session.mode, {}).get('emoji', '')} "
-                  f"**{MODES.get(session.mode, {}).get('label', session.mode)}**\n"
-                  f"Scope: `{session.scope}`",
-            inline=True,
-        )
-        embed.add_field(
-            name="⏳ Gültig",
-            value=f"**{session.to_public_dict()['expires_in']}**\n"
-                  f"bis `{iso(session.expires_at) or 'unbegrenzt'}`",
-            inline=True,
-        )
-        embed.add_field(name="🆔 Sitzung", value=f"`{session.id}`", inline=True)
-        embed.add_field(name="🌐 API-Basis", value=f"`{base}`", inline=False)
-        embed.add_field(name="🔑 Token", value=f"||`{token}`||", inline=False)
-        embed.add_field(
-            name="🖥️ Console",
-            value=f"[{console_url}]({console_url})\n"
-                  "Dort: Prompt mit **einem Klick** kopieren, Action-Log, API-Tester, Widerruf.",
-            inline=False,
-        )
-        warn = self._base_url_warning()
-        if warn:
-            embed.add_field(name="⚠️ Konfiguration", value=warn[:1000], inline=False)
-        embed.set_footer(
-            text="AIDiscordServerEinrichten · Token niemals weitergeben · /revoke entzieht den Zugriff"
-        )
-
         view = RelayButtons(self, console_url)
         try:
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+            await interaction.response.send_message(
+                content=_prompt_message(intro, short), view=view, ephemeral=True,
+            )
         except discord.HTTPException as exc:
             log.error("Antwort auf /%s fehlgeschlagen: %s", self.config.command_name, exc)
             return
-
-        # ── Nachricht 2: Prompt zum Kopieren + .md-Anhang ────────────────────
-        code_block = f"```\n{short}\n```"
-        if len(code_block) > 1990:
-            code_block = code_block[:1985] + "\n```"
-
-        attachment = discord.File(
-            io.BytesIO(long_text.encode("utf-8")),
-            filename="arena-prompt.md",
-            spoiler=False,
-        )
-        try:
-            await interaction.followup.send(
-                content=(
-                    "📋 **Dein Prompt für Arena AI** — einfach kopieren und dort einfügen:\n\n"
-                    + code_block
-                    + "\n\n📎 Die ausführliche Fassung (mit API-Referenz) hängt als "
-                      "`arena-prompt.md` an. Am bequemsten: **Console öffnen** → "
-                      "*Prompt kopieren*."
-                ),
-                file=attachment,
-                ephemeral=True,
-            )
-        except discord.HTTPException as exc:
-            log.warning("Prompt-Nachricht konnte nicht gesendet werden: %s", exc)
 
         log.info(
             "/%s ausgeführt von %s (%s) auf '%s' — Sitzung %s, Modus %s, gültig %s",
@@ -657,7 +598,7 @@ class RelayClient(discord.Client):
             guild_name=guild.name,
             created_by=member.id,
             created_by_name=member.display_name,
-            mode=old[-1].mode if old else "danger",
+            mode=normalize_mode(old[-1].mode) if old else DEFAULT_MODE,
             ttl_hours=self.config.session_ttl_hours,
             note="per Button erneuert",
         )
@@ -672,27 +613,14 @@ class RelayClient(discord.Client):
             console_url=f"{base}/console?t={token}",
         )
         short = short_prompt(prompt_ctx)
-        code_block = f"```\n{short}\n```"
-        if len(code_block) > 1990:
-            code_block = code_block[:1985] + "\n```"
 
-        embed = discord.Embed(
-            title="🔄 Neues Token erzeugt",
-            description=(
-                f"Alte Tokens dieses Servers bleiben gültig, bis sie ablaufen — "
-                f"nutze `/revoke`, um sie sofort zu deaktivieren.\n\n"
-                f"**API-Basis:** `{base}`\n"
-                f"**Token:** ||`{token}`||\n"
-                f"**Gültig:** {session.to_public_dict()['expires_in']}\n"
-                f"**Console:** [Link]({prompt_ctx.console_url})"
-            ),
-            color=ACCENT,
-            timestamp=now_utc(),
+        intro = (
+            "🔄 **Neues Token erzeugt.** Alte Tokens bleiben gültig, bis sie "
+            "ablaufen — mit `/revoke` sofort entziehen.\n"
+            "📋 Neuer Prompt für Arena AI (URL + Token stecken drin):\n\n"
         )
         await interaction.followup.send(
-            embed=embed, content="📋 **Neuer Prompt für Arena AI:**\n\n" + code_block,
-            file=discord.File(io.BytesIO(long_prompt(prompt_ctx).encode("utf-8")),
-                              filename="arena-prompt.md"),
+            content=_prompt_message(intro, short),
             view=RelayButtons(self, prompt_ctx.console_url),
             ephemeral=True,
         )
@@ -758,6 +686,15 @@ class RelayClient(discord.Client):
             "Details stehen im Render-Log.",
             color=ERR_COLOR,
         )
+
+
+def _prompt_message(intro: str, prompt_text: str) -> str:
+    """Intro + Prompt im Codeblock, garantiert unter Discords 2000-Zeichen-Limit."""
+    block = f"```\n{prompt_text}\n```"
+    budget = 1990 - len(intro)
+    if len(block) > budget:
+        block = block[: max(0, budget - 8)] + "\n…\n```"
+    return intro + block
 
 
 def _missing_permissions_text(perms: discord.Permissions) -> str:
