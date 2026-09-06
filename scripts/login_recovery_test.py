@@ -19,7 +19,11 @@ D. Echtes Discord-Rate-Limit→ ``Retry-After`` wird gedeckelt (nie 1800 s)
 D2. HTTP-Fehler             → Backoff eskaliert wieder (Zähler verfällt nicht)
 
 Dazu kommen Unit-Prüfungen für die Erkennung selbst (``Via``-Header,
-Cloudflare-HTML, Backoff-Rechnung, Konfigurations-Validierung, Proxy-Maskierung).
+Cloudflare-HTML, Backoff-Rechnung, Konfigurations-Validierung, Proxy-Maskierung)
+und eine Gruppe „Unit: Client-Setup", die den echten ``RelayClient`` durch
+``setup_hook()`` fährt — genau der Pfad, der bei jedem Login-Versuch läuft und
+in dem ein ``AttributeError`` ('add_listener' gibt es nur auf ``commands.Bot``,
+nicht auf ``discord.Client``) den Bot dauerhaft offline hielt.
 
 Die Zeit wird durch eine Fake-Uhr ersetzt: Der Test läuft in Millisekunden und
 prüft trotzdem die echten Wartewerte.
@@ -36,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import time as _real_time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -905,6 +910,117 @@ def test_state_units() -> None:
     check("Cloudflare-Ray im Report", data["discord_probe"]["cloudflare_ray"] == "deadbeef-FRA")
 
 
+async def test_client_setup() -> None:
+    """
+    Der echte ``RelayClient`` durch ``setup_hook()`` — ohne Netzwerk.
+
+    Genau dieser Pfad lief in keinem anderen Test: ``smoke_test.py`` fährt den
+    Web-Server gegen ``FakeClient``, hier wird ``client.start()`` weggepatcht.
+    Deshalb fiel der ``AttributeError`` (``add_listener`` existiert nur auf
+    ``commands.Bot``, nicht auf ``discord.Client``) erst auf Render auf —
+    ``setup_hook()`` wird von ``login()`` aufgerufen, der Login-Loop fing den
+    Crash als „Unerwarteter Fehler" und wiederholte ihn endlos.
+    """
+    print("\n── Unit: Client-Setup (setup_hook / on_interaction) ──────────")
+    cfg = load_config()
+    store = SessionStore(path=None, persist=False)
+    client = RelayClient(cfg, store, state=None)
+    client.state = AppState(client=client, config=cfg, store=store)
+
+    sync_calls: List[Any] = []
+
+    async def fake_sync(guild: Any = None) -> List[Any]:
+        sync_calls.append(guild)
+        return []
+
+    client.tree.sync = fake_sync  # type: ignore[method-assign]
+
+    # 1) setup_hook() darf nicht werfen — hier lag der AttributeError.
+    await client._async_setup_hook()
+    try:
+        await client.setup_hook()
+        setup_ok, setup_detail = True, ""
+    except Exception as exc:  # noqa: BLE001 — genau das soll sichtbar werden
+        setup_ok, setup_detail = False, repr(exc)
+    check("setup_hook() wirft nicht", setup_ok, setup_detail)
+
+    names = {c.name for c in client.tree.get_commands()}
+    check("drei Slash-Commands registriert",
+          names == {"connect", "status", "revoke"}, str(sorted(names)))
+    check("genau eine persistente Button-View",
+          len(client.persistent_views) == 1, str(len(client.persistent_views)))
+    check("Command-Sync wurde aufgerufen", len(sync_calls) == 1)
+
+    # 2) Button-Klicks: Die Buttons aus RelayButtons haben keinen Callback —
+    #    sie kommen ausschließlich über das globale on_interaction an.
+    hits: List[str] = []
+
+    async def fake_regenerate(interaction: Any) -> None:
+        hits.append("relay:regenerate")
+
+    async def fake_revoke_all(interaction: Any) -> None:
+        hits.append("relay:revoke_all")
+
+    client._handle_regenerate = fake_regenerate  # type: ignore[method-assign]
+    client._handle_revoke_all = fake_revoke_all  # type: ignore[method-assign]
+
+    def fake_interaction(type_: Any, custom_id: Optional[str] = None) -> Any:
+        class FakeInteraction:  # noqa: D401 — minimales Double
+            pass
+
+        it = FakeInteraction()
+        it.type = type_  # type: ignore[attr-defined]
+        it.data = {"custom_id": custom_id} if custom_id else None  # type: ignore[attr-defined]
+        return it
+
+    client.dispatch("interaction",
+                    fake_interaction(discord.InteractionType.component, "relay:regenerate"))
+    await asyncio.sleep(0.05)
+    client.dispatch("interaction",
+                    fake_interaction(discord.InteractionType.component, "relay:revoke_all"))
+    await asyncio.sleep(0.05)
+    client.dispatch("interaction",
+                    fake_interaction(discord.InteractionType.application_command))
+    await asyncio.sleep(0.05)
+
+    check("dispatch liefert 'relay:regenerate' an den Handler",
+          "relay:regenerate" in hits, str(hits))
+    check("dispatch liefert 'relay:revoke_all' an den Handler",
+          "relay:revoke_all" in hits, str(hits))
+    check("application_command-Interaktion wird ignoriert",
+          hits == ["relay:regenerate", "relay:revoke_all"], str(hits))
+
+    # 3) Der Login-Loop erzeugt ab Versuch 2 pro Versuch einen neuen Client:
+    #    zwei frische Clients nacheinander dürfen setup_hook() überstehen
+    #    (kein CommandAlreadyRegistered o. Ä.).
+    twice_ok, twice_detail = True, ""
+    for _ in range(2):
+        c2 = RelayClient(cfg, SessionStore(path=None, persist=False), state=None)
+        c2.state = AppState(client=c2, config=cfg, store=store)
+        c2.tree.sync = fake_sync  # type: ignore[method-assign]
+        await c2._async_setup_hook()
+        try:
+            await c2.setup_hook()
+        except Exception as exc:  # noqa: BLE001
+            twice_ok, twice_detail = False, repr(exc)
+    check("zwei frische Clients überstehen setup_hook() (Login-Loop)",
+          twice_ok, twice_detail)
+
+    # 4) Statischer Guard gegen den Rückfall: Bot-only-APIs (add_listener &
+    #    Co. existieren nur auf commands.Bot) dürfen in discord_bot.py nicht
+    #    wieder auftauchen — der Bot ist ein nacktes discord.Client.
+    with open(os.path.join(ROOT, "bot", "discord_bot.py"), encoding="utf-8") as fh:
+        source = fh.read()
+    banned = re.search(
+        r"self\.(add_listener|remove_listener|listen|add_cog|load_extension"
+        r"|add_command|process_commands|get_context|get_command|hybrid"
+        r"|command_prefix)\b",
+        source,
+    )
+    check("keine Bot-only-API in discord_bot.py (statischer Guard)",
+          banned is None, banned.group(0) if banned else "")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -914,6 +1030,7 @@ async def arun() -> int:
     test_backoff_units()
     test_config_units()
     test_state_units()
+    await test_client_setup()
     test_ledger_units()
     test_egress_tracking_units()
     await test_ip_ban_lifts()

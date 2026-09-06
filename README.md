@@ -617,7 +617,7 @@ python scripts/smoke_test.py          # 203 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
-python scripts/login_recovery_test.py # 130 Prüfungen zum Login/Rate-Limit-Verhalten
+python scripts/login_recovery_test.py # 139 Prüfungen: Login/Rate-Limit + Client-Setup
 python -m bot.netcheck                # echte Netz-Diagnose (IP + discord.com)
 ```
 
@@ -658,6 +658,7 @@ die Discord-Antworten — läuft also in Millisekunden, ohne Netzwerk und ohne T
 | IP frei, Login trotzdem 429 | Token-Problem: lange warten, **kein** Container-Neustart |
 | Discord-429 mit `Via`-Header | `Retry-After` wird gedeckelt — nie wieder 1800 s blind schlafen |
 | HTTP 5xx mehrfach | Backoff eskaliert (der Fehlerzähler verfällt nicht mehr) |
+| Client-Setup (echter `RelayClient`, kein Fake) | `setup_hook()` registriert 3 Commands + 1 persistente View; Button-Klicks (`relay:regenerate` / `relay:revoke_all`) erreichen ihre Handler; keine Bot-only-API in der Quelle |
 
 Der GitHub-Actions-Workflow liegt in [`ci/ci.yml`](ci/ci.yml) und prüft bei jedem
 Push und Pull Request Python **3.11 und 3.12**, baut zusätzlich das Docker-Image
@@ -677,6 +678,11 @@ und verlangt `/api/health` im laufenden Container.
 ---
 
 ## Fehlerbehebung
+
+**`AttributeError: 'RelayClient' object has no attribute 'add_listener'` im Log**
+Versionen vor **1.0.1** hatten einen Fehler in `setup_hook()` (Bot-only-API auf
+einem nackten `discord.Client`). Auf `main` aktualisieren — `/api/health` zeigt
+unter `version`, ob das Deploy die gefixte Version enthält (`1.0.1` oder neuer).
 
 **`/connect` erscheint nicht im Discord-Menü**
 Slash-Commands brauchen nach der Registrierung bis zu einer Stunde. Prüfe im
@@ -854,7 +860,7 @@ AIDiscordServerEinrichten/
 │           └── setup.py     Der Setup-Wizard + fünf Vorlagen
 ├── scripts/
 │   ├── smoke_test.py        203 Prüfungen ohne Discord-Verbindung
-│   ├── login_recovery_test.py 130 Prüfungen zum 429/1015-Verhalten (Fake-Uhr)
+│   ├── login_recovery_test.py 139 Prüfungen: 429/1015 + Client-Setup (Fake-Uhr)
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double
 ├── deploy/
 │   ├── docker-compose.yml   VPS: Bot + Caddy (HTTPS) aus dem vorhandenen Dockerfile
