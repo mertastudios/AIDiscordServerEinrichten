@@ -20,11 +20,12 @@ import io
 import logging
 from typing import Any, Dict, List, Optional
 
+import aiohttp
 import discord
 from discord import app_commands
 
 from . import __version__
-from .config import Config
+from .config import Config, mask_proxy_url
 from .prompt import PromptContext, long_prompt, short_prompt
 from .sessions import MODES, SessionStore
 from .util import ApiError, human_duration, iso, now_utc
@@ -34,6 +35,9 @@ log = logging.getLogger("relay.discord")
 __all__ = ("RelayClient", "build_intents", "ADMIN_INVITE_SCOPES")
 
 ADMIN_INVITE_SCOPES = ("bot", "applications.commands")
+
+#: Mindestabstand zwischen zwei globalen Slash-Command-Syncs (Sekunden).
+COMMAND_SYNC_MIN_INTERVAL = 3600.0
 
 ACCENT = discord.Color.from_str("#5865F2")
 OK_COLOR = discord.Color.from_str("#2ECC71")
@@ -141,7 +145,20 @@ class RelayClient(discord.Client):
         Client und ``AppState`` verweisen aufeinander; ``main.amain`` erzeugt
         deshalb erst den Client und setzt ``client.state`` direkt danach.
         """
-        super().__init__(intents=intents or build_intents(True))
+        options: Dict[str, Any] = {"intents": intents or build_intents(True)}
+        proxy = (getattr(config, "discord_proxy", "") or "").strip()
+        if proxy:
+            # discord.py reicht den Proxy an REST **und** Gateway weiter — genau
+            # das brauchen wir, wenn die ausgehende IP des Containers von
+            # Cloudflare gesperrt ist (Error 1015).
+            options["proxy"] = proxy
+            user = (getattr(config, "discord_proxy_user", "") or "").strip()
+            if user:
+                options["proxy_auth"] = aiohttp.BasicAuth(
+                    user, getattr(config, "discord_proxy_password", "") or ""
+                )
+            log.info("Discord-Traffic läuft über Proxy %s", mask_proxy_url(proxy))
+        super().__init__(**options)
         self.config = config
         self.store = store
         self.state = state
@@ -155,19 +172,38 @@ class RelayClient(discord.Client):
         # Persistente Button-View registrieren (URL-Button ist dekorativ,
         # die Custom-ID-Buttons brauchen den Handler).
         self.add_view(RelayButtons(self, f"{self.state.base_url()}/console"))
+        await self._sync_commands()
+
+    async def _sync_commands(self) -> None:
+        """
+        Registriert die Slash-Commands — höchstens einmal pro
+        ``COMMAND_SYNC_MIN_INTERVAL``.
+
+        Zwei Gründe für die Bremse:
+
+        1. Ein globaler Sync ist ein eigener Rate-Limit-Bucket. Bei jedem
+           Reconnect erneut zu syncen bringt nichts (die Commands stehen schon
+           serverseitig), erzeugt aber zusätzliche Anfragen — genau die wollen
+           wir bei einer Cloudflare-Sperre der IP vermeiden.
+        2. Ein fehlgeschlagener Sync darf den Bot niemals in einen Reconnect-
+           Loop zwingen: bereits registrierte Commands bleiben gültig.
+        """
+        last = getattr(self.state, "commands_synced_at", None)
+        now = now_utc()
+        if last is not None and (now - last).total_seconds() < COMMAND_SYNC_MIN_INTERVAL:
+            log.debug("Slash-Commands wurden vor %.0f s registriert — Sync übersprungen.",
+                      (now - last).total_seconds())
+            return
         try:
             await self.tree.sync()
-        except discord.HTTPException as exc:
-            # Ein fehlgeschlagener Sync (z. B. 429/Cloudflare-Bann) darf den Bot
-            # NICHT in einen Reconnect-Loop zwingen: Global registrierte Commands
-            # bleiben serverseitig aktiv, der Sync wird beim nächsten (Re-)Connect
-            # automatisch wiederholt. Der Bot läuft also weiter statt neu zu loggen
-            # (jeder neue Login würde einen laufenden Bann nur verlängern).
+        except Exception as exc:  # noqa: BLE001 — HTTPException, RateLimited, Sync-Fehler
             log.warning("Slash-Command-Sync fehlgeschlagen (%s) — Bot läuft weiter, "
                         "bereits registrierte Commands bleiben aktiv.", exc)
-        else:
-            log.info("Slash-Commands global registriert (Sync kann bis zu 1 Stunde dauern; "
-                     "auf bestehenden Servern meist sofort).")
+            return
+        if self.state is not None:
+            self.state.commands_synced_at = now
+        log.info("Slash-Commands global registriert (Sync kann bis zu 1 Stunde dauern; "
+                 "auf bestehenden Servern meist sofort).")
 
     async def on_ready(self) -> None:
         self.ready_at = now_utc()

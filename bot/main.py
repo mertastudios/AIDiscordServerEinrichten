@@ -9,13 +9,19 @@ Ablauf
 4. ``AppState`` + ``RelayClient`` bauen und miteinander verdrahten.
 5. aiohttp-Server auf ``0.0.0.0:$PORT`` starten → ab jetzt antwortet
    ``/api/health`` und UptimeRobot kann den Dienst wach halten.
-6. Bot mit Discord verbinden. Klappt das wegen nicht freigeschalteter
+6. Netzwerk-Diagnose im Hintergrund: ausgehende IP ermitteln und prüfen, ob
+   ``discord.com`` ohne Token erreichbar ist (``/api/v10/gateway``). Damit ist
+   im Log sofort sichtbar, OB die IP von Cloudflare gesperrt ist — die
+   häufigste Ursache für einen „offline"-Bot auf Free-Hosting.
+7. Bot mit Discord verbinden. Klappt das wegen nicht freigeschalteter
    **privilegierter Intents** nicht, wird automatisch ohne sie neu gestartet —
-   der Bot bleibt also online, statt im Crash-Loop zu hängen. Schlägt der
-   Login wegen eines **Rate-Limits / Cloudflare-Banns (429/1015)** fehl, wartet
-   der Bot exponentiell länger (statt Discord zu fluten) und verbindet sich
-   von selbst neu.
-7. Auf ``SIGTERM``/``SIGINT`` warten (Render schickt das bei jedem Deploy) und
+   der Bot bleibt also online, statt im Crash-Loop zu hängen. Blockt
+   Cloudflare die **ausgehende IP** (429 / Error 1015), probt der Bot alle
+   30 s tokenlos, ob die Sperre weg ist, und loggt sich sofort wieder ein.
+   Bleibt die IP zehn Minuten lang gesperrt, beendet sich der Prozess mit
+   Exit-Code 3 — Render startet dann einen frischen Container, der eine
+   andere (hoffentlich saubere) Ausgangs-IP bekommt.
+8. Auf ``SIGTERM``/``SIGINT`` warten (Render schickt das bei jedem Deploy) und
    sauber herunterfahren.
 """
 
@@ -32,11 +38,18 @@ import time
 from datetime import timedelta
 from typing import Any, Optional
 
+import aiohttp
 import discord
 
 from . import __botname__, __version__
 from .config import Config, ConfigError, load_config
 from .discord_bot import RelayClient, build_intents
+from .netcheck import (
+    VERDICT_NETWORK_ERROR,
+    NetReport,
+    proxy_auth_from,
+    run_netcheck,
+)
 from .sessions import SessionStore
 from .util import iso, now_utc
 from .web.app import AppState, build_app, start_web_server, stop_web_server
@@ -122,48 +135,128 @@ async def _housekeeping(state: AppState, stop: asyncio.Event) -> None:
         if now - last_beat >= 300:
             last_beat = now
             client = state.client
+            online = bool(client and getattr(client, "user", None))
+            report = state.net_report
+            net = ""
+            if not online:
+                # Solange der Bot offline ist, gehört die Netz-Lage in jeden
+                # Herzschlag: IP gesperrt oder Token-Problem? Ohne das raten
+                # Nutzer im Render-Log herum.
+                verdict = getattr(report, "verdict", "not_checked")
+                net = (
+                    f" · discord.com {'erreichbar' if getattr(report, 'discord_reachable', False) else 'GESPERRT'}"
+                    f" ({verdict})"
+                    f" · IP {getattr(report, 'egress_ip', None) or '?'}"
+                    f" · Login-Status {state.discord_status}"
+                    + (f" · nächster Versuch {state.discord_retry_at}" if state.discord_retry_at else "")
+                )
             log.info(
-                "❤ Uptime %dh%02dm · Server %d · Anfragen %d · Fehler %d · Sessions %d · Gateway %s",
+                "❤ Uptime %dh%02dm · Server %d · Anfragen %d · Fehler %d · Sessions %d · Gateway %s%s",
                 int(state.uptime_seconds() // 3600),
                 int((state.uptime_seconds() % 3600) // 60),
                 len(client.guilds) if client else 0,
                 state.request_count, state.error_count,
                 len(state.store.all_active()),
                 f"{round(client.latency * 1000)} ms" if client and client.latency else "–",
+                net,
             )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Login-Wiederholung mit Backoff (Schutz vor 429 / Cloudflare Error 1015)
+#  Login-Wiederholung: IP-Sperre erkennen, kurz proben, notfalls IP wechseln
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Hintergrund: Schlägt ``client.start()`` beim Login fehl, weil Cloudflare die
-# IP vorübergehend sperrt (Error 1015 → discord.py wirft sofort
-# ``HTTPException: 429``, ganz ohne internen Wiederholungsversuch), dann
-# verlängert JEDE weitere Anfrage während des Banns den Bann. Ein sturer
-# „alle 10 Sekunden neu versuchen“-Loop hält den Bot deshalb *dauerhaft*
-# offline — er flutet sich selbst in die Sperre. Genau das verhindern die
-# Helfer unten: exponentiell wachsende Wartezeiten mit Zufalls-Jitter,
-# Respekt vor dem ``Retry-After``-Header des Servers und eine echte
-# Abkühlphase (mind. 60 s) nach jedem 429er.
+# Was bei „HTTP 429 / Cloudflare Error 1015" wirklich passiert
+# ------------------------------------------------------------
+# Discord liegt hinter Cloudflare. Überschreitet eine IP Discords Limit
+# (10.000 *ungültige* Anfragen — 401/403/429 — pro 10 Minuten bzw. 50
+# Anfragen/s insgesamt), blockt Cloudflare die **IP-Adresse**, nicht den Token:
+# Jede Anfrage von dort wird mit 429 und einer HTML-Seite beantwortet.
+# discord.py erkennt das am fehlenden ``Via``-Header und wirft sofort, ohne
+# internen Wiederholungsversuch.
 #
-# Zweite Lektion: Fatale Fehler (falscher Token, dauerhaft abgewiesene
-# Verbindung) beenden den Prozess bewusst NICHT mehr. Ein Exit würde Render
-# sofort neu starten lassen (Crash-Loop) — also Login-Spam, der ebenfalls in
-# einem Cloudflare-Bann endet. Stattdessen bleiben Web-Server und /api/health
-# erreichbar und der Login wird in großem Abstand erneut versucht.
+# Auf Free-Plänen (Render, Railway, Replit …) teilen sich hunderte Kunden
+# wenige Ausgangs-IPs. Flutet ein anderer Mieter Discord, ist die IP für *alle*
+# gesperrt — der eigene Bot ist dann völlig unschuldig und kommt trotzdem nicht
+# online. Ohne Diagnose sieht dieser Fall exakt aus wie ein kaputter Bot.
+#
+# Warum „30 Minuten schlafen und dann erneut versuchen" hier falsch war
+# --------------------------------------------------------------------
+# Der alte Code hat den ``Retry-After``-Wert der Blockseite respektiert und bis
+# zu 1800 s gewartet. Bei einer *geteilten* IP ist das die schlechteste aller
+# Strategien:
+#
+#   * Das Zeitfenster der Sperre ist häufig nach wenigen Minuten vorbei — wer
+#     30 Minuten schläft, verpasst es und läuft direkt in die nächste Sperre.
+#   * Flutet ein Nachbar dauerhaft, ist die IP *unbegrenzt* verbrannt. Dann
+#     hilft kein Warten der Welt, sondern nur eine andere IP.
+#   * Der Zähler „Fehlversuche in Folge" wurde nach 300 s ohne Versuch
+#     zurückgesetzt — bei 1800 s Wartezeit eskalierte das Backoff also niemals
+#     (im Log stand deshalb immer „Fehlversuch 1 in Folge" + 1800 s).
+#
+# Die neue Strategie
+# ------------------
+# 1. **Diagnose statt Raterei** (:mod:`bot.netcheck`): Vor dem ersten Login und
+#    während jeder Sperre wird ``GET https://discord.com/api/v10/gateway``
+#    *ohne Token* aufgerufen. Der Endpoint liegt hinter derselben Cloudflare-
+#    Regel, erzeugt aber keine ungültige Anfrage. Damit ist sauber trennbar:
+#    IP gesperrt (Probe 429) vs. Token-Problem (Probe 200, Login trotzdem 429).
+#    Zusätzlich wird die ausgehende IP ermittelt und ins Log geschrieben — die
+#    steht sonst nirgends, ist aber der eigentliche Übeltäter.
+# 2. **Kurz und oft proben statt lange schlafen**: alle
+#    ``BAN_PROBE_INTERVAL_SECONDS`` (Default 30 s) = 20 Proben pro 10 Minuten
+#    = 0,2 % von Discords 10.000er-Limit. Sobald eine Probe grün ist, wird
+#    *sofort* eingeloggt — statt bis zum Ablauf eines blinden Timers zu warten.
+# 3. **IP wechseln, wenn die IP verbrannt ist**: bleibt die Sperre
+#    ``BAN_WATCH_SECONDS`` (Default 10 min) bestehen, beendet sich der Prozess
+#    mit Exit-Code 3. Render startet daraufhin einen frischen Container, und
+#    der bekommt eine *andere* Adresse aus Renders geteiltem Ausgangs-Bereich
+#    („your service might use any IP address within its associated ranges").
+#    Genau das ist die Standard-Empfehlung bei diesem Fehler: neu deployen, bis
+#    man eine nicht gesperrte IP erwischt. Vor jedem Neustart liegen immer
+#    ≥ ``BAN_WATCH_SECONDS`` Beobachtung — ein heißer Crash-Loop entsteht nicht.
+# 4. **Proxy als dauerhafte Lösung**: ``DISCORD_PROXY`` wird an discord.py
+#    durchgereicht (REST *und* Gateway). Damit verlässt der Traffic das
+#    Rechenzentrum über eine eigene, saubere IP.
+#
+# Fatale Fehler (falscher Token, dauerhaft abgewiesene Gateway-Verbindung)
+# beenden den Prozess weiterhin NICHT: Ein Exit würde Render sofort neu starten
+# lassen (Crash-Loop = Login-Spam = frische Sperre). Web-Server und
+# /api/health bleiben erreichbar, der Login wird in großem Abstand versucht.
 
-#: Mindestwartezeit nach einem Cloudflare-Bann (Error 1015), egal beim wievielten Versuch.
-CLOUDFLARE_MIN_WAIT = 60.0
-#: Mindestwartezeit nach einem normalen Discord-Rate-Limit (429 mit Via-Header).
+#: Kurze Abkühlphase nach einem Cloudflare-Block, bevor das Proben beginnt.
+CLOUDFLARE_MIN_WAIT = 20.0
+#: Mindestwartezeit nach einem echten Discord-Rate-Limit (429 *mit* Via-Header).
 DISCORD_RATELIMIT_MIN_WAIT = 30.0
-#: Harte Obergrenze für einen einzelnen Wartezyklus (schützt vor absurd großen
-#: Retry-After-Werten und unbeabsichtigtem Dauer-Schlaf).
-MAX_SINGLE_WAIT = 1800.0
-#: Verjährung: Liegt der letzte Fehlversuch länger zurück, gilt der nächste
-#: Ausfall wieder als Einzelfall und wird schnell neu versucht (statt mit der
-#: über Stunden aufgebauten Maximalwartezeit).
-BACKOFF_RESET_AFTER = 300.0
+#: Harte Obergrenze für einen einzelnen Wartezyklus (war 1800 s — zu lang).
+MAX_SINGLE_WAIT = 300.0
+#: Verjährung des Fehlerzählers. Muss GRÖSSER als die längste Wartezeit sein,
+#: sonst eskaliert das Backoff nie (genau das war der alte Bug).
+BACKOFF_RESET_AFTER = 1800.0
+#: Obergrenze, wenn die Sperre am Token hängt — eine neue IP bringt dann nichts.
+TOKEN_BAN_MAX_WAIT = 3600.0
+#: Exit-Code für „Plattform, bitte gib mir einen frischen Container".
+EXIT_CODE_RESTART = 3
+#: Wie lange auf die erste Netz-Diagnose gewartet wird, bevor der erste
+#: Login-Versuch startet (verhindert einen Versuch in eine bekannt gesperrte IP).
+NETCHECK_STARTUP_WAIT = 15.0
+
+
+class RestartRequested(Exception):
+    """
+    Der Prozess soll beendet werden, damit die Plattform neu startet.
+
+    Einziger Auslöser: eine nachweislich (per unauthentifizierter Probe)
+    gesperrte ausgehende IP, die sich im Beobachtungsfenster nicht erholt hat.
+    Ein frischer Container bekommt bei Render eine andere Adresse aus dem
+    geteilten Ausgangs-Bereich — oft die einzige Möglichkeit, wieder online zu
+    kommen.
+    """
+
+    def __init__(self, reason: str, exit_code: int = EXIT_CODE_RESTART) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.exit_code = exit_code
 
 
 def _extract_retry_after(exc: BaseException) -> Optional[float]:
@@ -196,10 +289,10 @@ def _is_cloudflare_ban(exc: discord.HTTPException) -> bool:
     True, wenn der 429er von Cloudflare (z. B. Error 1015) statt von Discord kommt.
 
     discord.py wirft genau dann sofort (ohne internen Retry), wenn der
-    429-Antwort der ``Via``-Header fehlt oder der Body kein JSON ist — beides
-    ist bei einer Cloudflare-Fehlerseite der Fall. (Der ``error code: 0`` allein
-    taugt NICHT als Kriterium: Auch echte Discord-429-JSONs enthalten oft kein
-    ``code``-Feld. Entscheidend ist der fehlende ``Via``-Header.)
+    429-Antwort der ``Via``-Header fehlt **oder** der Body kein JSON ist —
+    beides ist bei einer Cloudflare-Fehlerseite der Fall. (Der ``error code: 0``
+    allein taugt NICHT als Kriterium: Auch echte Discord-429-JSONs enthalten oft
+    kein ``code``-Feld.)
     """
     if getattr(exc, "status", 0) != 429:
         return False
@@ -208,9 +301,21 @@ def _is_cloudflare_ban(exc: discord.HTTPException) -> bool:
     if headers is None:
         return True  # nichts inspizierbar → vorsichtig wie einen Bann behandeln
     try:
-        return not bool(headers.get("Via"))
+        if not headers.get("Via"):
+            return True
     except Exception:  # noqa: BLE001 — defensiv: im Zweifel wie ein Bann behandeln
         return True
+    # Via ist da, aber discord.py hat trotzdem HTTPException (statt RateLimited)
+    # geworfen ⇒ der Body war kein JSON ⇒ Fehlerseite von Cloudflare oder einem
+    # Zwischensystem. Wichtig: NUR HTML zählt als Blockseite. Auf den Text
+    # „rate limited" zu prüfen wäre falsch — Discords eigene 429-JSONs sagen
+    # exakt das ("You are being rate limited.") und sind gerade KEIN IP-Bann.
+    text = str(getattr(exc, "text", "") or "").strip().lower()
+    if not text:
+        return False
+    if text.startswith("<") or "<html" in text:
+        return True
+    return "cloudflare" in text or "error 1015" in text
 
 
 def _backoff_delay(base: float, cap: float, failures: int) -> float:
@@ -223,22 +328,195 @@ def _backoff_delay(base: float, cap: float, failures: int) -> float:
     return exp / 2.0 + random.uniform(0, exp / 2.0)
 
 
+def _proxy_auth(config: Config) -> Optional[Any]:
+    """``aiohttp.BasicAuth`` für den Discord-Proxy, falls Zugangsdaten gesetzt sind."""
+    return proxy_auth_from(config)
+
+
+async def _run_netcheck(config: Config, state: AppState, *, with_egress_ip: bool = True) -> Any:
+    """
+    Führt die Netz-Diagnose aus und hinterlegt sie im Zustand.
+
+    Wirft nie: Eine Diagnose, die selbst fehlschlägt, darf den Bot nicht
+    aufhalten — dann steht das Ergebnis eben als Fehler im Report.
+    """
+    try:
+        report = await run_netcheck(
+            proxy=(config.discord_proxy or None),
+            proxy_auth=_proxy_auth(config),
+            timeout=config.netcheck_timeout_seconds,
+            with_egress_ip=with_egress_ip,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Netz-Diagnose fehlgeschlagen: %s", exc)
+        report = NetReport(verdict=VERDICT_NETWORK_ERROR,
+                           hint=f"Diagnose nicht ausführbar: {exc}",
+                           checked_at=iso(now_utc()) or "")
+    state.set_net_report(report)
+    return report
+
+
+def _log_report(report: Any, *, level: int = logging.INFO) -> None:
+    for line in report.summary():
+        log.log(level, "  %s", line)
+
+
+async def _watch_ip_ban(config: Config, state: AppState, stop: asyncio.Event, *,
+                        cause: str, report: Any) -> bool:
+    """
+    Beobachtet eine gesperrte IP, bis sie wieder frei ist oder das Fenster abläuft.
+
+    Die Proben sind **unauthentifiziert** (``GET /api/v10/gateway``): Sie
+    brauchen kein Token, zählen bei Discord nicht als ungültige Anfrage und
+    liegen trotzdem hinter derselben Cloudflare-Regel wie der Login. Damit
+    erkennt der Bot das Ende der Sperre innerhalb von Sekunden — statt einen
+    blinden 30-Minuten-Timer abzusitzen.
+
+    Liefert ``True``, sobald discord.com wieder erreichbar ist (→ sofort neu
+    einloggen), sonst ``False``.
+    """
+    state.ban_watches += 1
+    probe_interval = max(5.0, config.ban_probe_interval_seconds)
+    budget = config.ban_watch_seconds
+    # budget <= 0 heißt „unbegrenzt probieren, nie neu starten" — dann gibt es
+    # keine Frist. Ohne diese Unterscheidung entstünde ein Heißloop, der Discord
+    # mit Login-Versuchen flutet (genau das, was die Sperre verlängert).
+    unlimited = budget <= 0.0
+    deadline = float("inf") if unlimited else time.monotonic() + budget
+    watch_no = state.ban_watches
+    probe_no = 0
+
+    log.error(
+        "❌ Discord blockiert die AUSGEHENDE IP dieses Containers (%s).\n"
+        "   Das ist kein Fehler im Bot und keiner im Token: Cloudflare sperrt\n"
+        "   die IP (Error 1015), auf Free-Plänen ist sie mit anderen Kunden\n"
+        "   geteilt. Der Bot probt jetzt alle %.0f s mit einem tokenlosen\n"
+        "   Aufruf, ob die Sperre aufgehoben ist, und loggt sich SOFORT ein,\n"
+        "   sobald discord.com wieder durchlässt (Beobachtungsfenster: %s).",
+        cause, probe_interval, "unbegrenzt" if unlimited else f"{budget:.0f} s",
+    )
+    _log_report(report, level=logging.ERROR)
+
+    while not stop.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        wait = min(probe_interval, remaining)
+        state.discord_status = "ip_blocked"
+        state.discord_last_error = (
+            f"Ausgehende IP von Cloudflare gesperrt ({cause}). "
+            f"Ausgangs-IP: {report.egress_ip or 'unbekannt'}"
+        )[:300]
+        state.discord_retry_at = iso(now_utc() + timedelta(seconds=wait))
+        await _sleep_or_stop(stop, wait)
+        if stop.is_set():
+            return False
+
+        probe_no += 1
+        report = await _run_netcheck(config, state, with_egress_ip=False)
+        if report.discord_reachable:
+            log.info(
+                "✅ discord.com ist wieder erreichbar (Probe %d in Beobachtung %d) — "
+                "Login wird sofort neu versucht.", probe_no, watch_no,
+            )
+            return True
+        probe = report.discord
+        left = deadline - time.monotonic()
+        # Nicht jede Probe ins Log: alle 5. und die letzte reichen, der Rest auf
+        # DEBUG. Sonst steht bei 10 Minuten Beobachtung zwanzigmal dieselbe
+        # Zeile im Render-Log und verdeckt die wichtigen Meldungen.
+        level = logging.WARNING if (probe_no == 1 or probe_no % 5 == 0 or left <= probe_interval) \
+            else logging.DEBUG
+        log.log(
+            level,
+            "⏳ IP weiter gesperrt (Probe %d, HTTP %s%s) — Restfenster %s.",
+            probe_no,
+            getattr(probe, "status", None) or "—",
+            f", Ray {probe.cf_ray}" if getattr(probe, "cf_ray", None) else "",
+            "unbegrenzt" if left == float("inf") else f"{max(0.0, left):.0f} s",
+        )
+        if left <= 0:
+            return False
+    return False
+
+
+async def _give_up_on_ip(config: Config, state: AppState, stop: asyncio.Event, *,
+                         cause: str, report: Any) -> None:
+    """
+    Entscheidung, wenn die IP im Beobachtungsfenster nicht frei wurde.
+
+    Mit ``RESTART_ON_IP_BAN=true`` (Default) beendet sich der Prozess, damit die
+    Plattform einen frischen Container startet — der bekommt eine andere
+    Adresse aus dem geteilten Ausgangs-Bereich. Ohne diese Option wird einfach
+    weiter probiert.
+    """
+    if config.restart_on_ip_ban and config.ban_watch_seconds > 0 and not stop.is_set():
+        log.critical(
+            "🔁 Ausgehende IP bleibt gesperrt (%s) — dieser Container kommt so nie\n"
+            "   online. Der Prozess beendet sich gleich mit Exit-Code %d, damit\n"
+            "   Render einen FRISCHEN Container startet. Der zieht eine andere\n"
+            "   Adresse aus Renders geteiltem Ausgangs-Bereich — bei einer von\n"
+            "   anderen Mietern verbrannten IP ist das die einzig wirksame\n"
+            "   Maßnahme (und genau das rät auch der Plattform-Support).\n"
+            "   Gesperrte IP : %s\n"
+            "   Dauerhaft ruhig wird es mit eigener Ausgangs-IP:\n"
+            "     · DISCORD_PROXY=http://user:pass@host:port  (z. B. QuotaGuard)\n"
+            "     · oder Hosting mit fester/dedizierter IP (VPS, Fly.io, Railway)\n"
+            "   Abschalten dieses Verhaltens: RESTART_ON_IP_BAN=false",
+            cause, EXIT_CODE_RESTART, report.egress_ip or "unbekannt",
+        )
+        state.restart_requested = f"ip_blocked:{cause}"
+        state.discord_status = "ip_blocked"
+        await _sleep_or_stop(stop, config.restart_delay_seconds)
+        if stop.is_set():
+            return
+        raise RestartRequested(f"Ausgehende IP dauerhaft von Cloudflare gesperrt ({cause})")
+
+    # Neustart ist abgeschaltet: bewusst abkühlen, bevor weiter probiert wird.
+    # Ohne diese Pause würde der Loop sofort den nächsten Login feuern — und
+    # damit genau das tun, was eine IP-Sperre verlängert.
+    cooldown = max(120.0, config.ban_probe_interval_seconds * 4)
+    log.error(
+        "IP bleibt gesperrt (%s) — Neustart ist deaktiviert (RESTART_ON_IP_BAN=false). "
+        "%.0f s Abkühlphase, danach wird weiter probiert.", cause, cooldown,
+    )
+    state.discord_status = "ip_blocked"
+    state.discord_last_error = (
+        f"Ausgehende IP bleibt gesperrt ({cause}); Neustart deaktiviert."
+    )[:300]
+    state.discord_retry_at = iso(now_utc() + timedelta(seconds=cooldown))
+    await _sleep_or_stop(stop, cooldown)
+
+
+async def _await_first_netcheck(state: AppState, timeout: float = NETCHECK_STARTUP_WAIT) -> Any:
+    """Wartet kurz auf die Start-Diagnose, damit der erste Login nicht blind ist."""
+    event = state.net_ready()
+    if event.is_set():
+        return state.net_report
+    try:
+        await asyncio.wait_for(event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        log.debug("Start-Diagnose nicht innerhalb von %.0f s fertig — weiter ohne sie.", timeout)
+    return state.net_report
+
+
 async def _connect_bot(
     config: Config, store: SessionStore, state: AppState, stop: asyncio.Event
 ) -> None:
     """
-    Verbindet den Bot mit Discord — mit automatischem Fallback auf
-    nicht-privilegierte Intents und Backoff bei Rate-Limits.
+    Verbindet den Bot mit Discord — mit Intent-Fallback, IP-Sperren-Erkennung
+    und Backoff.
 
     Ohne den Intent-Fallback würde ein vergessener Schalter im Developer Portal
     (``SERVER MEMBERS INTENT``) zu einem endlosen Crash-Loop auf Render führen.
-    Ohne das Backoff würde ein 429/Cloudflare-Bann durch sture Wiederholung
-    endlos verlängert — der Bot käme nie wieder online.
+    Ohne die Sperren-Erkennung säße der Bot bei einer von Cloudflare gesperrten
+    IP in einem blinden 30-Minuten-Timer fest und käme nie wieder online.
     """
     privileged = config.enable_privileged_intents
     attempt = 0
     failures = 0
     last_failure = 0.0
+    token_bans = 0
 
     def note_failure() -> int:
         """Zählt einen Fehlversuch (mit Verjährung alter Ausfälle)."""
@@ -265,8 +543,19 @@ async def _connect_bot(
         state.discord_retry_at = iso(now_utc() + timedelta(seconds=max(0.0, delay)))
         await _sleep_or_stop(stop, delay)
 
+    # Start-Diagnose abwarten: Ist die IP schon VOR dem ersten Versuch gesperrt,
+    # sparen wir uns eine unnötige (ungültige) Anfrage an Discord.
+    startup_report = await _await_first_netcheck(state)
+    if startup_report is not None and startup_report.ip_blocked:
+        log.warning("Start-Diagnose: discord.com ist von dieser IP aus nicht erreichbar.")
+        if not await _watch_ip_ban(config, state, stop, cause="Start-Diagnose",
+                                   report=startup_report):
+            await _give_up_on_ip(config, state, stop, cause="Start-Diagnose",
+                                 report=startup_report)
+
     while not stop.is_set():
         attempt += 1
+        state.login_attempts = attempt
         intents = build_intents(privileged)
         # WICHTIG: Ein ``client.close()`` beendet die interne aiohttp-Session
         # endgültig — derselbe Client kann danach NICHT erneut ``start()``en
@@ -339,39 +628,72 @@ async def _connect_bot(
             with contextlib.suppress(Exception):
                 await client.close()
             status = getattr(exc, "status", 0)
-            retry_after = _extract_retry_after(exc)
-            delay = backoff()
-            if status == 429:
-                # 429 beim Login = der kritische Fall: Jede weitere Anfrage kann
-                # den Bann verlängern → echte Abkühlphase, kein Schnellschuss.
-                floor = CLOUDFLARE_MIN_WAIT if _is_cloudflare_ban(exc) else DISCORD_RATELIMIT_MIN_WAIT
-                delay = max(delay, floor)
-            if retry_after is not None:
-                delay = max(delay, retry_after + 5.0)
-            delay = min(delay, MAX_SINGLE_WAIT)
+            state.login_failures += 1
+
             if status == 429 and _is_cloudflare_ban(exc):
+                # ── Der Kernfall: Cloudflare blockt die ausgehende IP ────────
+                # Zuerst messen, woran es wirklich hängt, statt zu raten:
+                report = await _run_netcheck(config, state)
+                ray = getattr(getattr(exc, "response", None), "headers", {})
+                ray_id = ""
+                with contextlib.suppress(Exception):
+                    ray_id = str(ray.get("CF-RAY") or "")
+                if report.ip_blocked:
+                    failures = note_failure()
+                    token_bans = 0
+                    if await _watch_ip_ban(config, state, stop,
+                                           cause=f"Login HTTP 429{f', Ray {ray_id}' if ray_id else ''}",
+                                           report=report):
+                        continue  # IP wieder frei → sofort neu einloggen
+                    await _give_up_on_ip(config, state, stop, cause="Login HTTP 429", report=report)
+                    continue
+                if report.discord_reachable:
+                    # discord.com kommt ohne Token durch, mit Token aber nicht:
+                    # Die Sperre hängt am TOKEN/Account, nicht an der IP. Eine
+                    # neue IP bringt hier nichts — also lange warten und deutlich
+                    # sagen, was zu tun ist.
+                    token_bans += 1
+                    delay = min(config.fatal_retry_seconds * (2 ** (token_bans - 1)), TOKEN_BAN_MAX_WAIT)
+                    log.critical(
+                        "❌ Login rate-limitiert (HTTP 429), aber discord.com ist ohne Token\n"
+                        "   erreichbar ⇒ die Sperre hängt am TOKEN, nicht an der IP.\n"
+                        "   Ursachen: dasselbe Token läuft in zwei Prozessen (lokal + Render!),\n"
+                        "   doppelte Render-Instanzen oder zu viele ungültige Anfragen.\n"
+                        "   → Alle anderen Prozesse mit diesem Token stoppen.\n"
+                        "   → Falls das nichts hilft: Developer Portal → Bot → 'Reset Token'\n"
+                        "     und das neue Token in Render eintragen.\n"
+                        "   Neuer Versuch in %.0f s.", delay,
+                    )
+                    await wait_and_report(delay, "rate_limited",
+                                          f"HTTP 429 beim Login trotz erreichbarer IP: {exc}"[:300])
+                    continue
+                # Weder IP-Sperre noch erreichbar: Netzwerk-/DNS-Problem.
+                delay = min(backoff(), MAX_SINGLE_WAIT)
                 log.error(
-                    "❌ Discord-Login rate-limitiert (HTTP 429, Cloudflare-Bann/Error 1015). "
-                    "Die IP ist vorübergehend gesperrt — jeder weitere Versuch in dieser Zeit "
-                    "würde den Bann VERLÄNGERN. Der Bot wartet jetzt automatisch %.0f s "
-                    "(Fehlversuch %d in Folge) und verbindet sich dann neu. Bitte in dieser "
-                    "Zeit NICHT manuell neu deployen/starten — das setzt die Wartezeit zurück! "
-                    "Typische Ursachen: geteilte Render-IP (Free-Plan), derselbe Token in zwei "
-                    "Prozessen (z. B. lokal + Render gleichzeitig) oder viele Restarts kurz "
-                    "hintereinander.",
-                    delay, failures,
+                    "❌ discord.com ist nicht erreichbar (%s). Neuer Versuch in %.0f s.",
+                    getattr(report.discord, "error", None) or f"HTTP {status}", delay,
                 )
-            elif status == 429:
+                await wait_and_report(delay, "network_error",
+                                      f"discord.com nicht erreichbar: {exc}"[:300])
+                continue
+
+            retry_after = _extract_retry_after(exc)
+            delay = min(backoff(), MAX_SINGLE_WAIT)
+            if status == 429:
+                delay = max(delay, DISCORD_RATELIMIT_MIN_WAIT)
+            if retry_after is not None:
+                # Retry-After wird respektiert, aber gedeckelt: Ein einzelner
+                # Header darf den Bot nicht für eine halbe Stunde parken.
+                delay = min(max(delay, retry_after + 5.0), MAX_SINGLE_WAIT)
+            if status == 429:
                 log.error(
-                    "❌ Discord-Rate-Limit beim Login (HTTP 429). Neuer Versuch in %.0f s "
-                    "(Fehlversuch %d in Folge).",
-                    delay, failures,
+                    "❌ Discord-Rate-Limit beim Login (HTTP 429, Via-Header vorhanden). "
+                    "Neuer Versuch in %.0f s (Fehlversuch %d in Folge).", delay, failures,
                 )
             else:
                 log.error(
                     "❌ Discord meldete HTTP %s beim Login (%s). Neuer Versuch in %.0f s "
-                    "(Fehlversuch %d in Folge).",
-                    status, exc, delay, failures,
+                    "(Fehlversuch %d in Folge).", status, exc, delay, failures,
                 )
             await wait_and_report(
                 delay, "rate_limited" if status == 429 else "waiting",
@@ -395,7 +717,7 @@ async def _connect_bot(
         except discord.GatewayNotFound:
             with contextlib.suppress(Exception):
                 await client.close()
-            delay = backoff()
+            delay = min(backoff(), MAX_SINGLE_WAIT)
             log.error("Discord-Gateway nicht erreichbar — neuer Versuch in %.0f s.", delay)
             await wait_and_report(delay, "waiting", "GatewayNotFound: Gateway nicht erreichbar")
             continue
@@ -416,7 +738,7 @@ async def _connect_bot(
                     f"Gateway dauerhaft geschlossen (Code {getattr(exc, 'code', '?')})",
                 )
                 continue
-            delay = backoff()
+            delay = min(backoff(), MAX_SINGLE_WAIT)
             log.warning("Gateway-Verbindung getrennt (Code %s) — neuer Versuch in %.0f s.",
                         getattr(exc, "code", "?"), delay)
             await wait_and_report(
@@ -424,14 +746,35 @@ async def _connect_bot(
                 f"Gateway getrennt (Code {getattr(exc, 'code', '?')})",
             )
             continue
+        except (aiohttp.ClientError, OSError) as exc:
+            # DNS/TCP/TLS: discord.com ist von diesem Container aus schlicht nicht
+            # erreichbar. Bewusst KEIN Traceback-Feuerwerk — die Ursache steht
+            # bereits in der Netz-Diagnose (GET /api/diagnostics bzw. im
+            # Start-Log), hier reicht eine Zeile mit dem nächsten Versuch.
+            with contextlib.suppress(Exception):
+                await client.close()
+            delay = min(backoff(), MAX_SINGLE_WAIT)
+            log.error(
+                "❌ Netzwerkfehler beim Login (%s: %s). discord.com ist von diesem "
+                "Container aus nicht erreichbar — das ist ein DNS-/Firewall-/Proxy-"
+                "Problem und keines am Token. Neuer Versuch in %.0f s "
+                "(Fehlversuch %d in Folge). Details: GET /api/diagnostics",
+                type(exc).__name__, str(exc)[:160], delay, failures,
+            )
+            await wait_and_report(
+                delay, "network_error", f"{type(exc).__name__}: {exc}"[:300]
+            )
+            continue
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
                 await client.close()
             raise
+        except RestartRequested:
+            raise
         except Exception:
             with contextlib.suppress(Exception):
                 await client.close()
-            delay = backoff()
+            delay = min(backoff(), MAX_SINGLE_WAIT)
             log.exception("Unerwarteter Fehler beim Bot-Start (Versuch %d) — neuer Versuch in %.0f s.",
                           attempt, delay)
             await wait_and_report(delay, "waiting", "Unerwarteter Fehler beim Bot-Start (siehe Log)")
@@ -441,6 +784,35 @@ async def _connect_bot(
         state.discord_status = "closed"
         log.info("Bot-Verbindung beendet.")
         break
+
+
+async def _startup_netcheck(config: Config, state: AppState, stop: asyncio.Event) -> None:
+    """
+    Hintergrund-Task: einmalige Netz-Diagnose beim Start.
+
+    Läuft parallel zum Web-Server (der antwortet sofort auf ``/api/health``) und
+    wird vom Login-Loop abgewartet, bevor der erste Versuch gefeuert wird. So
+    steht im Render-Log direkt, welche ausgehende IP der Container hat und ob
+    ``discord.com`` überhaupt erreichbar ist — statt erst nach einem
+    fehlgeschlagenen Login raten zu müssen.
+    """
+    if stop.is_set():
+        state.net_ready().set()
+        return
+    log.info("Netz-Diagnose: ermittle ausgehende IP und prüfe discord.com (ohne Token) …")
+    report = await _run_netcheck(config, state)
+    _log_report(report, level=logging.INFO if report.verdict == "ok" else logging.WARNING)
+    if report.ip_blocked:
+        log.warning(
+            "⚠ discord.com blockt diese ausgehende IP schon VOR dem ersten Login-Versuch. "
+            "Der Login wird deshalb nicht blind gefeuert — der Bot wartet, bis die Sperre "
+            "nachweislich aufgehoben ist (Details: GET /api/diagnostics)."
+        )
+    elif report.verdict != "ok":
+        log.warning(
+            "⚠ discord.com ist von diesem Container aus nicht erreichbar. Bleibt das "
+            "so, ist es ein Netzwerk-/DNS-Problem: GET /api/diagnostics zeigt Details."
+        )
 
 
 async def _sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
@@ -507,6 +879,7 @@ async def amain() -> int:
         log.info("  · Console     : %s/console", state.base_url())
 
         housekeeping = asyncio.create_task(_housekeeping(state, stop), name="housekeeping")
+        netcheck_task = asyncio.create_task(_startup_netcheck(config, state, stop), name="netcheck")
         bot_task = asyncio.create_task(_connect_bot(config, store, state, stop), name="bot")
 
         waiter = asyncio.create_task(stop.wait(), name="shutdown-signal")
@@ -515,20 +888,35 @@ async def amain() -> int:
         )
         if waiter in done:
             log.info("Stop-Signal empfangen — fahre herunter …")
+
+        exit_code = 0
         if bot_task in done and not stop.is_set():
             exc = bot_task.exception()
-            if exc is not None:
+            if isinstance(exc, RestartRequested):
+                # Bewusster Neustart-Wunsch: Die ausgehende IP ist nachweislich
+                # von Cloudflare gesperrt und hat sich im Beobachtungsfenster
+                # nicht erholt. Ein frischer Container = neue Chance auf eine
+                # saubere IP. Exit-Code 3 unterscheidet das im Render-Log von
+                # einem echten Absturz (Exit-Code 1).
+                log.critical("Beende den Prozess für einen Container-Neustart: %s", exc)
+                exit_code = exc.exit_code
+            elif exc is not None:
                 log.critical("Bot-Task beendet mit Fehler: %r", exc)
+                exit_code = 1
+            if exit_code:
                 stop.set()
-                housekeeping.cancel()
+                for task in (housekeeping, netcheck_task):
+                    task.cancel()
                 if runner:
                     await stop_web_server(runner)
-                return 1
+                store.save()
+                return exit_code
 
         stop.set()
         housekeeping.cancel()
+        netcheck_task.cancel()
         bot_task.cancel()
-        for task in (bot_task, housekeeping):
+        for task in (bot_task, housekeeping, netcheck_task):
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(task, timeout=10)
     except KeyboardInterrupt:  # pragma: no cover

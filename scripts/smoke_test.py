@@ -639,9 +639,12 @@ async def t_security(h: Harness) -> None:
     check("Bot-Token steht nicht in der (maskierten) Konfiguration",
           "smoke.test.token" not in json.dumps(public_cfg, default=str))
     masked = cfg.masked()
+    masked_token = str(masked.get("discord_token", ""))
     check("Config.masked() kürzt den Token",
           "smoke.test.token" not in json.dumps(masked, default=str)
-          and "…" in str(masked.get("discord_token", "")))
+          and ("…" in masked_token or masked_token.startswith("***")), masked_token)
+    check("Config.masked() schwärzt kurze Geheimnisse vollständig",
+          masked_token.startswith("***") and "smoke" not in masked_token, masked_token)
     check("Config.masked() bleibt sonst lesbar", masked.get("command_name") == "connect")
 
     caps = await h.anon.call("GET", "/api/v1/capabilities")

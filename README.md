@@ -235,6 +235,7 @@ deshalb nichts vorher wissen und nichts auswendig lernen.
 | Endpoint | Zweck |
 | -------- | ----- |
 | `GET /api/health` | Öffentlich. Für UptimeRobot und den Render Health Check. |
+| `GET /api/diagnostics` | Öffentlich. Ausgehende IP, Erreichbarkeit von Discord, Login-Status, nächste Schritte. |
 | `GET /api/v1/capabilities` | Komplette API-Beschreibung. **Immer zuerst aufrufen.** |
 | `GET /api/v1/guild/snapshot` | Der gesamte Ist-Zustand in **einem** Aufruf. |
 | `GET /api/v1/me` | Wer bin ich, wo bin ich, was darf ich? |
@@ -397,6 +398,17 @@ Eine kommentierte Vorlage liegt in [`.env.example`](.env.example).
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. |
 | `PRIVILEGED_INTENTS` | `true` | Members- und Message-Content-Intent anfordern. |
 | `SETTLE_SCALE` | `1.0` | Faktor für Cache-Wartezeiten. `0` nur für Tests. |
+| `DISCORD_PROXY` | *(leer)* | HTTP(S)-Proxy für **alle** Discord-Verbindungen (REST + Gateway). Dauerhafte Lösung bei gesperrter Cloud-IP. |
+| `DISCORD_PROXY_USER` | *(leer)* | Proxy-Benutzername (falls nicht in der URL). |
+| `DISCORD_PROXY_PASSWORD` | *(leer)* | Proxy-Passwort (erscheint maskiert im Log). |
+| `NETCHECK_TIMEOUT_SECONDS` | `8` | Zeitgrenze der Netzwerk-Diagnose beim Start. |
+| `BAN_PROBE_INTERVAL_SECONDS` | `30` | Abstand der tokenlosen Proben, während die IP gesperrt ist. |
+| `BAN_WATCH_SECONDS` | `600` | So lange wird die Sperre beobachtet, bevor der Container neu gestartet wird. `0` = nie. |
+| `RESTART_ON_IP_BAN` | `true` | Bei dauerhaft gesperrter IP: Prozess beenden (Exit-Code 3) → Render startet neu → neue IP. |
+| `RESTART_DELAY_SECONDS` | `30` | Pause vor diesem bewussten Neustart. |
+| `LOGIN_RETRY_BASE_SECONDS` | `15` | Basis des Backoffs nach anderen Login-Fehlern. |
+| `LOGIN_RETRY_MAX_SECONDS` | `600` | Obergrenze des Backoffs. |
+| `FATAL_RETRY_SECONDS` | `300` | Abstand nach fatalen Fehlern (ungültiges Token, Gateway 4004 …). |
 
 ---
 
@@ -438,9 +450,12 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # ~200 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 199 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
+
+python scripts/login_recovery_test.py # 72 Prüfungen zum Login/Rate-Limit-Verhalten
+python -m bot.netcheck                # echte Netz-Diagnose (IP + discord.com)
 ```
 
 Der Smoke-Test startet den **echten** Web-Server gegen einen simulierten
@@ -463,6 +478,20 @@ Discord-Client ([`scripts/_fake_discord.py`](scripts/_fake_discord.py)) und prü
 Die Test-Double sind **echte Unterklassen** von `discord.Role`,
 `discord.TextChannel`, `discord.Member` usw. — damit die `isinstance`-Prüfungen
 der API tatsächlich greifen und der Test nicht an Attrappen vorbeiläuft.
+
+[`scripts/login_recovery_test.py`](scripts/login_recovery_test.py) prüft den Teil,
+der einen Bot auf Free-Hosting zuverlässig offline hält: das Verhalten bei
+`429 / Cloudflare Error 1015`. Er ersetzt die Uhr durch eine Fake-Uhr und scriptet
+die Discord-Antworten — läuft also in Millisekunden, ohne Netzwerk und ohne Token:
+
+| Fall | Erwartetes Verhalten |
+| ------ | -------------------- |
+| IP-Sperre hebt sich | tokenlose Proben alle 30 s, danach **sofort** neuer Login |
+| IP bleibt gesperrt | nach `BAN_WATCH_SECONDS` → `RestartRequested` (Exit-Code 3) |
+| `RESTART_ON_IP_BAN=false` | unbegrenzt weiter probieren, kein Prozess-Exit |
+| IP frei, Login trotzdem 429 | Token-Problem: lange warten, **kein** Container-Neustart |
+| Discord-429 mit `Via`-Header | `Retry-After` wird gedeckelt — nie wieder 1800 s blind schlafen |
+| HTTP 5xx mehrfach | Backoff eskaliert (der Fehlerzähler verfällt nicht mehr) |
 
 Der GitHub-Actions-Workflow liegt in [`ci/ci.yml`](ci/ci.yml) und prüft bei jedem
 Push und Pull Request Python **3.11 und 3.12**, baut zusätzlich das Docker-Image
@@ -502,19 +531,76 @@ Token fehlt, ist abgelaufen oder wurde widerrufen. `/connect` erneut ausführen.
 Jede dieser Antworten enthält einen `hint` mit genau dieser Anleitung.
 
 **Bot bleibt offline: `429 Too Many Requests` / Cloudflare `Error 1015`**
-Die IP ist bei Discord vorübergehend gesperrt (*„You are being rate
-limited"*). Der Bot erkennt das, wartet automatisch immer länger (mind. 60 s,
-danach exponentiell bis 10 Minuten) und verbindet sich von selbst neu —
-**einfach laufen lassen und NICHT ständig „Redeploy"/„Restart" drücken**
-(jeder Neustart setzt die Wartezeit zurück und kann den Bann verlängern).
-Im Render-Log steht, wann der nächste Versuch startet; `GET /api/health`
-zeigt zusätzlich `discord_status`, `discord_last_error` und `discord_retry_at`.
-Typische Ursachen: geteilte Render-IP im Free-Plan, derselbe Token in zwei
-Prozessen gleichzeitig (z. B. lokal **und** auf Render — einen davon stoppen!),
-doppelte Render-Instanzen (`numInstances` muss `1` sein) oder viele Restarts
-kurz hintereinander. Dauert der Bann länger als ~1 Stunde: doppelte Prozesse
-stoppen, Token im Developer Portal zurücksetzen (falls er irgendwo doppelt
-läuft) und ggf. auf einen bezahlten Plan mit eigener ausgehender IP wechseln.
+
+Das ist in über 90 % der Fälle **kein Fehler im Bot und keiner im Token**,
+sondern eine gesperrte **ausgehende IP-Adresse**. Discord liegt hinter
+Cloudflare; überschreitet eine IP das Limit (10.000 *ungültige* Anfragen pro
+10 Minuten bzw. 50 Anfragen/s), blockt Cloudflare jede Anfrage von dieser IP mit
+`429` und einer HTML-Seite („Error 1015 — You are being rate limited"). Auf
+Free-Plänen teilen sich hunderte Kunden wenige Ausgangs-IPs: Flutet ein anderer
+Mieter Discord, ist die IP für **alle** gesperrt — dein Bot kommt dann nie
+online, obwohl er völlig korrekt ist.
+
+**Schritt 1 — Diagnose (30 Sekunden):**
+
+```
+https://<dein-service>.onrender.com/api/diagnostics
+```
+
+Öffentlich, ohne Token, funktioniert auch bei offline-Bot (der Web-Server läuft
+immer). Alternativ in der Render-Shell: `python -m bot.netcheck`. Entscheidend
+ist `verdict`:
+
+| `verdict` | Bedeutung | Was zu tun ist |
+| --------- | --------- | -------------- |
+| `ip_blocked` | Cloudflare sperrt die ausgehende IP (`egress_ip`). | **Nichts am Bot ändern** — der regelt das selbst (siehe unten). Dauerhaft: eigene IP besorgen. |
+| `ok`, Bot trotzdem offline | Discord ist erreichbar, der Login scheitert aus einem anderen Grund. | `login.status` lesen: `invalid_token` → Token resetten; `rate_limited` → doppelte Prozesse stoppen; `connection_refused` → Intents prüfen. |
+| `network_error` | `discord.com` ist gar nicht erreichbar (DNS/TCP/TLS). | Ausgehenden Traffic/Firewall des Hosters prüfen, ggf. `DISCORD_PROXY`. |
+
+**Schritt 2 — was der Bot automatisch tut** (bei `ip_blocked`):
+
+1. Er misst die Sperre mit einem **tokenlosen** Aufruf von
+   `GET https://discord.com/api/v10/gateway`. Der liegt hinter derselben
+   Cloudflare-Regel wie der Login, zählt aber nicht als ungültige Anfrage.
+2. Er probt alle `BAN_PROBE_INTERVAL_SECONDS` (30 s = 20 Anfragen pro
+   10 Minuten = 0,2 % von Discords 10.000er-Limit) und loggt sich **sofort**
+   ein, sobald die Sperre fällt. Blind 30 Minuten zu schlafen — wie es eine
+   frühere Version tat — verpasst genau dieses Fenster.
+3. Bleibt die IP `BAN_WATCH_SECONDS` (10 min) lang gesperrt, ist sie faktisch
+   verbrannt. Dann beendet sich der Prozess mit **Exit-Code 3**, Render startet
+   einen frischen Container, und der zieht eine andere Adresse aus Renders
+   geteiltem Ausgangs-Bereich. Das ist exakt die Empfehlung, die der
+   Plattform-Support bei diesem Fehler gibt: neu starten, bis man eine nicht
+   gesperrte IP erwischt. Im Log steht vor jedem Neustart die gesperrte IP.
+4. `GET /api/health` zeigt laufend `discord_status` (`ip_blocked`, `rate_limited`,
+   `network_error`, `connecting`, `online`), `egress_ip`, `discord_reachable`
+   und `discord_retry_at`.
+
+**Manuell eingreifen musst du nur, wenn es nicht von selbst weggeht:**
+
+- **Doppelte Prozesse ausschließen** — häufigste *selbstgemachte* Ursache:
+  derselbe Token läuft lokal **und** auf Render, oder ein zweiter Render-Service
+  nutzt dasselbe Token. Alles außer einem stoppen. `numInstances` muss `1` sein.
+- **Eigene Ausgangs-IP** (die dauerhafte Lösung, ~5 Minuten):
+  ```
+  DISCORD_PROXY=http://user:pass@host:port      # z. B. QuotaGuard Static
+  DISCORD_PROXY_USER=…   DISCORD_PROXY_PASSWORD=…
+  ```
+  discord.py schickt dann REST **und** Gateway über diesen Proxy. Der Bot bleibt
+  auf Render Free, aber Discord sieht nur noch die saubere Proxy-IP.
+- **Anderer Hoster:** VPS, Fly.io oder Railway mit dedizierter/fester IP. Ein
+  bezahlter Render-Plan allein ändert nichts — Renders Ausgangs-IPs bleiben
+  auch dort geteilte CIDR-Bereiche (dedizierte IPs sind ein Workspace-Add-on).
+- **Neustart abschalten**, falls du lieber selbst deployen willst:
+  `RESTART_ON_IP_BAN=false` (dann probt der Bot unbegrenzt weiter).
+
+> **Früher stand hier „warte einfach und deploye nicht neu".** Das war bei
+> einer *geteilten* IP der falsche Rat: Der `Retry-After`-Wert der Blockseite
+> ließ den Bot bis zu 1800 s schlafen, und weil der Zähler für Fehlversuche nach
+> 300 s ohne Versuch zurückgesetzt wurde, eskalierte nichts — es stand jedes Mal
+> „Fehlversuch 1 in Folge" im Log, und der Bot hing für immer in einem
+> 30-Minuten-Takt fest. Deshalb gibt es jetzt die Diagnose, die kurzen Proben
+> und den IP-Wechsel per Container-Neustart.
 
 **Bot startet nicht: `LoginFailure`**
 `DISCORD_BOT_TOKEN` ist ungültig. Im Developer Portal **Reset Token**, neues
@@ -552,6 +638,7 @@ AIDiscordServerEinrichten/
 │   ├── __main__.py          python -m bot
 │   ├── discord_bot.py       /connect, /status, /revoke, Buttons, Rechteprüfungen
 │   ├── config.py            Umgebungsvariablen, Validierung, maskierte Ausgabe
+│   ├── netcheck.py          Netz-Diagnose: ausgehende IP + discord.com-Probe
 │   ├── sessions.py          Token erzeugen, hashen, verifizieren, widerrufen
 │   ├── prompt.py            Die drei Prompt-Varianten für Arena AI
 │   ├── serializers.py       discord.py-Objekte → JSON-sichere Dicts
@@ -578,7 +665,8 @@ AIDiscordServerEinrichten/
 │           ├── events.py    Scheduled Events
 │           └── setup.py     Der Setup-Wizard + fünf Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        ~200 Prüfungen ohne Discord-Verbindung
+│   ├── smoke_test.py        199 Prüfungen ohne Discord-Verbindung
+│   ├── login_recovery_test.py 72 Prüfungen zum 429/1015-Verhalten (Fake-Uhr)
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double
 ├── ci/
 │   ├── ci.yml               GitHub-Actions-Workflow (siehe ci/README.md)

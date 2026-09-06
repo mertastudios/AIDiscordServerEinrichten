@@ -34,6 +34,7 @@ from ...serializers import (
     serialize_welcome_screen,
     serialize_widget,
 )
+from ...netcheck import VERDICT_IP_BLOCKED, VERDICT_OK, proxy_auth_from, run_netcheck
 from ...util import iso, sf
 from ..context import Ctx
 from ..registry import ENDPOINTS, endpoints_by_tag, route
@@ -81,6 +82,14 @@ async def health(ctx: Ctx) -> Dict[str, Any]:
         "discord_status": getattr(state, "discord_status", "connecting"),
         "discord_last_error": getattr(state, "discord_last_error", None),
         "discord_retry_at": getattr(state, "discord_retry_at", None),
+        # Netzwerk-Fakten: Bei „Bot offline" steht hier sofort, ob die
+        # AUSGEHENDE IP von Cloudflare gesperrt ist (discord_reachable=false,
+        # discord_status=ip_blocked). Details: GET /api/diagnostics
+        "egress_ip": getattr(state, "egress_ip", None),
+        "discord_reachable": getattr(getattr(state, "net_report", None), "discord_reachable", None),
+        "login_attempts": getattr(state, "login_attempts", 0),
+        "login_failures": getattr(state, "login_failures", 0),
+        "restart_requested": getattr(state, "restart_requested", None),
         "bot_user": user.name if user else None,
         "bot_id": sf(user.id) if user else None,
         "guilds": len(client.guilds) if client is not None else 0,
@@ -93,6 +102,121 @@ async def health(ctx: Ctx) -> Dict[str, Any]:
         "discord_py": discord.__version__,
         "timestamp": state.now_iso(),
         "base_url": state.base_url(),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Diagnose (öffentlich — der Bot ist bei einer IP-Sperre ja nicht erreichbar
+#  über Discord, aber der Web-Server läuft; deshalb ohne Token nutzbar)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@route(
+    "GET", "/api/diagnostics",
+    public=True, scope="read", tags=("meta",),
+    summary="Netz-Diagnose: ausgehende IP + Erreichbarkeit von Discord",
+    description="Antwortet auf die Frage ‚ist der Bot kaputt oder ist die IP "
+                "gesperrt?\'. Zeigt die ausgehende IP des Containers, ob "
+                "``discord.com`` ohne Token erreichbar ist (Cloudflare Error "
+                "1015), den Login-Status und konkrete nächste Schritte. Mit "
+                "``?refresh=1`` wird sofort neu gemessen (höchstens alle 60 s).",
+    query={"refresh": "1 = sofort neu messen (gedrosselt auf 1× pro 60 s)"},
+    response='{"ok":true,"data":{"verdict":"ip_blocked","egress_ip":"203.0.113.7",'
+             '"discord_reachable":false,"what_to_do":["…"]}}',
+    examples=[{"curl": 'curl -s "$BASE/api/diagnostics?refresh=1"'}],
+)
+async def diagnostics(ctx: Ctx) -> Dict[str, Any]:
+    """
+    Netzwerk- und Login-Diagnose — öffentlich und ohne Token.
+
+    Bewusst öffentlich: Genau in dem Moment, in dem man sie braucht (Bot ist
+    offline, kein ``/connect`` möglich), kommt man an alles andere nicht heran.
+    Verraten wird nur, was auch im Render-Log steht — kein Token, keine
+    Sitzungsdaten, Proxy-Zugangsdaten maskiert.
+    """
+    state = ctx.request.app["relay_ctx"]
+    config = ctx.config
+
+    if ctx.q_bool("refresh") and state.net_report_age() >= 60.0:
+        report = await run_netcheck(
+            proxy=(config.discord_proxy or None),
+            proxy_auth=proxy_auth_from(config),
+            timeout=config.netcheck_timeout_seconds,
+        )
+        state.set_net_report(report)
+
+    report = state.net_report
+    net = report.to_dict() if report is not None else {"verdict": "not_checked"}
+    verdict = net.get("verdict", "unknown")
+
+    steps: List[str] = []
+    if verdict == VERDICT_IP_BLOCKED:
+        steps = [
+            "Nichts am Bot ändern — die AUSGEHENDE IP ist bei Cloudflare gesperrt "
+            "(Error 1015). Der Bot probt automatisch weiter und loggt sich sofort "
+            "ein, sobald die Sperre fällt.",
+            "Nicht manuell neu deployen, während der Bot probt: Das setzt die "
+            "Wartezeit zurück. Nach Ablauf des Beobachtungsfensters "
+            f"({int(config.ban_watch_seconds)} s) startet er sich selbst neu und "
+            "zieht dabei meist eine andere IP.",
+            "Dauerhaft ruhig wird es nur mit eigener Ausgangs-IP: "
+            "DISCORD_PROXY setzen (z. B. QuotaGuard Static) oder auf einen Host "
+            "mit dedizierter/fester IP wechseln (VPS, Fly.io, Railway).",
+            "Prüfen, ob dasselbe Token noch woanders läuft (lokal, zweiter "
+            "Render-Service): doppelte Logins erzeugen genau diese Sperren.",
+        ]
+    elif verdict == VERDICT_OK and getattr(state, "discord_status", "") != "online":
+        steps = [
+            "discord.com ist erreichbar — die IP ist also NICHT gesperrt.",
+            "Steht discord_status auf 'invalid_token': DISCORD_BOT_TOKEN im "
+            "Developer Portal zurücksetzen und in Render neu eintragen.",
+            "Steht er auf 'rate_limited': Das Limit hängt am Token, nicht an der "
+            "IP → alle anderen Prozesse mit diesem Token stoppen.",
+            "Steht er auf 'connection_refused': Intents im Developer Portal "
+            "prüfen (SERVER MEMBERS INTENT / MESSAGE CONTENT INTENT).",
+        ]
+    elif verdict == "not_checked":
+        steps = ["Diagnose läuft noch — in ein paar Sekunden mit ?refresh=1 erneut abrufen."]
+    else:
+        steps = [
+            "discord.com war nicht erreichbar (DNS/TCP/TLS) — das ist ein "
+            "Netzwerkproblem des Containers, kein Discord-Problem.",
+            "DISCORD_PROXY prüfen, falls gesetzt; sonst ausgehenden Traffic des "
+            "Hosters/Firewall kontrollieren.",
+        ]
+
+    return {
+        "checked_at": net.get("checked_at"),
+        "age_seconds": round(state.net_report_age(), 1),
+        "verdict": verdict,
+        "egress_ip": net.get("egress_ip"),
+        "discord_reachable": net.get("discord_reachable"),
+        "proxy": net.get("proxy"),
+        "discord_probe": net.get("discord_probe"),
+        "login": {
+            "status": getattr(state, "discord_status", "connecting"),
+            "last_error": getattr(state, "discord_last_error", None),
+            "retry_at": getattr(state, "discord_retry_at", None),
+            "attempts": getattr(state, "login_attempts", 0),
+            "failures": getattr(state, "login_failures", 0),
+            "ip_ban_watches": getattr(state, "ban_watches", 0),
+            "restart_requested": getattr(state, "restart_requested", None),
+            "bot_connected": bool(getattr(getattr(state, "client", None), "user", None)),
+        },
+        "settings": {
+            "ban_probe_interval_seconds": config.ban_probe_interval_seconds,
+            "ban_watch_seconds": config.ban_watch_seconds,
+            "restart_on_ip_ban": config.restart_on_ip_ban,
+            "restart_delay_seconds": config.restart_delay_seconds,
+            "login_retry_base_seconds": config.login_retry_base_seconds,
+            "login_retry_max_seconds": config.login_retry_max_seconds,
+            "fatal_retry_seconds": config.fatal_retry_seconds,
+            "privileged_intents": config.enable_privileged_intents,
+            "discord_py": discord.__version__,
+            "python": platform.python_version(),
+        },
+        "what_to_do": steps,
+        "render_shell_command": "python -m bot.netcheck",
     }
 
 
