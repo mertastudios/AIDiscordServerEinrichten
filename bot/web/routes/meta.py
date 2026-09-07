@@ -350,6 +350,36 @@ async def capabilities(ctx: Ctx) -> Dict[str, Any]:
             "channel_types": ["text", "announcement", "voice", "stage", "forum", "media", "category"],
             "reason_field": 'Fast jeder schreibende Endpoint akzeptiert "reason" für das Audit-Log.',
             "retry_on_429": "Bei 429 error.details.retry_after Sekunden warten.",
+            "webhook_first": (
+                "System-Nachrichten (Regeln, Willkommen, News, Infos) immer als Webhook-Persona "
+                'senden: {"webhook": {"name": "📜 Serverregeln", "avatar": "https://…"}} — '
+                "nie als nüchterne Bot-Nachricht. Details: GET /api/v1/guides/webhooks."
+            ),
+            "cleanup_before_repost": (
+                "Vor dem erneuten Posten von Regeln/Infos die alten Nachrichten im Kanal löschen: "
+                'POST /api/v1/channels/{id}/purge {"bots_only": true, "confirm": true} '
+                '(Nachrichten älter als 14 Tage brauchen "bulk": false). Nie doppelte Versionen.'
+            ),
+            "mentions_no_placeholders": (
+                "Niemals Platzhalter-Mentions senden (<@123…>, <#000…>) — echte IDs vorher per "
+                "GET auflösen (channels/roles/members). Im Setup-Plan werden <#key>-Mentions "
+                "automatisch zu echten Kanal-Mentions aufgelöst."
+            ),
+            "permissions_always": (
+                "Jede Rolle bekommt explizite permissions (oder ein preset), jede Kategorie "
+                "overwrites — Info-Bereiche: @everyone deny send_messages; Team-Bereiche: "
+                "deny view_channel + allow für Team-Rollen."
+            ),
+            "unicode_design": (
+                "Kanäle/Kategorien/Rollen mit Unicode-Stil benennen: 「✦」regeln, 「📌」 INFORMATION, "
+                "꒰👑꒱ Owner, ✦・chat. Style-Guide: GET /api/v1/guides/design."
+            ),
+            "third_party_bots": (
+                "Konfiguration fremder Bots (Self Roles, Musik, Tickets) ist tabu — ehrlich "
+                "erklären, alles Vorarbeitbare liefern (Rollen/Kanal/Persona-Nachricht) und die "
+                "fertige Schritt-für-Schritt-Anleitung posten: GET /api/v1/guides/self-roles. "
+                "Commands anderer Bots aufzurufen ist erlaubt."
+            ),
         },
         "scopes": {
             "read": "nur GET",
@@ -375,8 +405,10 @@ async def capabilities(ctx: Ctx) -> Dict[str, Any]:
             f'GET {base}/api/v1/guild/snapshot — kompletter Ist-Zustand in einem Aufruf',
             f'GET {base}/api/v1/channels/tree  — Kanalstruktur als Baum',
             f'GET {base}/api/v1/roles          — Rollen & deren Permissions',
-            f'POST {base}/api/v1/setup         — komplettes Setup in EINEM Aufruf',
-            "danach gezielt PATCH/POST/DELETE für Einzeländerungen",
+            f'GET {base}/api/v1/guides         — Design-/Brandings-/Self-Roles-Vorlagen',
+            f'POST {base}/api/v1/setup         — komplettes Setup in EINEM Aufruf (Unicode-Design + Webhook-Personen + Overwrites)',
+            'PATCH {base}/api/v1/members/me    — Bot-Avatar/Nickname für DIESEN Server',
+            "danach gezielt PATCH/POST/DELETE für Einzeländerungen — alte Regeln/Infos vorher per purge entfernen",
             f'GET {base}/api/v1/guild/snapshot — Erfolg verifizieren',
         ],
         "curl_templates": {
@@ -491,6 +523,13 @@ async def me(ctx: Ctx) -> Dict[str, Any]:
             "note": "Der Bot kann keine Rolle verwalten, deren Position >= seiner eigenen "
                     "Top-Rolle liegt. Rollen also möglichst tief anlegen oder die Bot-Rolle "
                     "nach ganz oben schieben.",
+        },
+        "bot_profile": {
+            "nick": getattr(me, "nick", None),
+            "avatar_url": _asset(getattr(me, "display_avatar", None)) if me else None,
+            "hint": "Eigenes Server-Profil (Nickname, Avatar nur für diesen Server, Banner, "
+                    "Bio) ändern: PATCH /api/v1/members/me — Teil des Branding-Pakets "
+                    "(GET /api/v1/guides/branding).",
         },
         "base_url": state.base_url(),
         "links": {

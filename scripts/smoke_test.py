@@ -272,7 +272,8 @@ async def t_auth(h: Harness) -> None:
           and "text/plain" in prompt_sys["headers"].get("Content-Type", ""))
     check("System-Prompt nennt API-Pfad + Token",
           "/api/v1/capabilities" in prompt_sys["text"] and token in prompt_sys["text"])
-    check("System-Prompt warnt vor destruktiven Aktionen", "destruktiv" in prompt_sys["text"])
+    check("System-Prompt warnt vor destruktiven Aktionen",
+          "destruktiv" in prompt_sys["text"] or "Destruktives" in prompt_sys["text"])
     prompt_bad = await api.call("GET", "/api/v1/prompt?variant=unbekannt")
     check("Unbekannte Prompt-Variante → 400", prompt_bad["status"] == 400)
 
@@ -343,7 +344,7 @@ async def t_read(h: Harness) -> None:
 
     templates = await api.call("GET", "/api/v1/setup/templates")
     check("Setup-Vorlagen → 200", templates["status"] == 200)
-    check("5 Vorlagen vorhanden", templates["json"]["data"].get("count") == 5)
+    check("6 Vorlagen vorhanden", templates["json"]["data"].get("count") == 6)
 
     snapshot = await api.call("GET", "/api/v1/guild/snapshot?members=10")
     check("Snapshot → 200", snapshot["status"] == 200, str(snapshot["json"])[:400])
@@ -567,7 +568,7 @@ async def t_write(h: Harness) -> None:
 
     templates = await api.call("GET", "/api/v1/setup/templates")
     names = [t["key"] for t in templates["json"]["data"]["templates"]]
-    check("Vorlagenliste vollständig", len(names) == 5, str(names))
+    check("Vorlagenliste vollständig", len(names) == 6, str(names))
 
     for name in names:
         guild = MutableGuild()
@@ -611,6 +612,185 @@ async def t_write(h: Harness) -> None:
 
     # Server zurücktauschen, damit die Folge-Gruppen wieder den Standard-Server sehen
     client.swap_guild(_standard_guild())
+
+
+async def t_arena(h: Harness) -> None:
+    """
+    Der Arena-Upgrade-Flow: Webhook-Personen, Bot-Profil, Guides,
+    echte Kanal-Mentions im Setup und Purge vor dem Erneuern.
+    """
+    print("── Arena-Flow: Webhooks, Bot-Profil, Guides, Mentions ───────")
+    api = h.api("danger")
+    client = h.state.client
+
+    guild = MutableGuild()
+    client.swap_guild(guild)
+    try:
+        # ── 1. Persona-Sendekomfort: Nachricht mit webhook-Spec ────────────
+        sent = await api.call("POST", f"/api/v1/channels/{TEXT_ID}/messages", body={
+            "webhook": {"name": "📜 Serverregeln"},
+            "content": "Die neuen Regeln!",
+            "pin": True,
+        })
+        check("Webhook-Persona senden → 200", sent["status"] == 200, str(sent["json"])[:300])
+        sent_data = sent["json"].get("data", {})
+        check("Antwort meldet via=webhook", sent_data.get("via") == "webhook")
+        check("Webhook wurde angelegt", len(guild._webhooks) == 1,
+              f"{len(guild._webhooks)} Webhooks")
+        check("Persona-Mutation protokolliert",
+              any(m.startswith("webhook.send:") for m in guild.mutations),
+              str(guild.mutations[-5:]))
+
+        # nochmal senden → derselbe Webhook wird wiederverwendet
+        again = await api.call("POST", f"/api/v1/channels/{TEXT_ID}/messages", body={
+            "webhook": {"name": "📜 Serverregeln"}, "content": "Update"})
+        check("Zweite Persona-Nachricht → 200", again["status"] == 200)
+        check("Webhook wird wiederverwendet (kein zweiter)", len(guild._webhooks) == 1,
+              f"{len(guild._webhooks)} Webhooks")
+
+        # ── 2. Webhook-Verwaltung ──────────────────────────────────────────
+        hooks = await api.call("GET", "/api/v1/webhooks")
+        check("GET /api/v1/webhooks listet Server-Webhooks",
+              hooks["status"] == 200 and hooks["json"]["data"]["count"] == 1,
+              str(hooks["json"])[:200])
+        hook_id = hooks["json"]["data"]["webhooks"][0]["id"]
+
+        patched = await api.call("PATCH", f"/api/v1/webhooks/{hook_id}",
+                                 body={"name": "📜 Die Regeln"})
+        check("Webhook umbenennen → 200", patched["status"] == 200, str(patched["json"])[:200])
+        check("Webhook-Name geändert",
+              patched["json"]["data"]["webhook"]["name"] == "📜 Die Regeln")
+
+        direct = await api.call("POST", f"/api/v1/webhooks/{hook_id}/send", body={
+            "content": "Direktgesendet", "username": "📣 News"})
+        check("POST /webhooks/{id}/send → 200", direct["status"] == 200,
+              str(direct["json"])[:300])
+        check("Direkt-Send nutzt Override-Name",
+              direct["json"]["data"]["webhook"]["name"] == "📣 News")
+
+        single = await api.call("GET", f"/api/v1/webhooks/{hook_id}")
+        check("GET /api/v1/webhooks/{id} → 200", single["status"] == 200)
+
+        # ── 3. Bot-Profil (Nickname + Server-Avatar) ───────────────────────
+        tiny_png = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFc"
+                    "SJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+        prof = await api.call("PATCH", "/api/v1/members/me", body={
+            "nick": "✨ Server-Assistent", "avatar": tiny_png})
+        check("PATCH /api/v1/members/me → 200", prof["status"] == 200, str(prof["json"])[:300])
+        check("Bot-Nickname gesetzt", prof["json"]["data"].get("nick") == "✨ Server-Assistent",
+              str(prof["json"].get("data", {}).get("nick")))
+        check("Avatar-Mutation protokolliert",
+              any(m.startswith("member.edit:avatar:") for m in guild.mutations))
+
+        empty = await api.call("PATCH", "/api/v1/members/me", body={})
+        check("Leeres Profil-Update → NO_CHANGES", empty["status"] == 400
+              and empty["json"]["error"]["code"] == "NO_CHANGES")
+
+        # ── 4. Guides ──────────────────────────────────────────────────────
+        guides = await api.call("GET", "/api/v1/guides")
+        topics = {g["topic"] for g in guides["json"]["data"]["guides"]}
+        check("Guides verzeichnen self-roles & design",
+              {"self-roles", "design"} <= topics, str(topics))
+        sr = await api.call("GET", "/api/v1/guides/self-roles")
+        check("Self-Roles-Guide enthält Bot-Anleitungen",
+              sr["status"] == 200 and "carl-bot" in json.dumps(sr["json"]["data"]).lower())
+        check("Self-Roles-Guide ehrlich zu Grenzen",
+              "nicht konfigurieren" in json.dumps(sr["json"], ensure_ascii=False).lower())
+        design = await api.call("GET", "/api/v1/guides/design")
+        check("Design-Guide zeigt Unicode-Stile",
+              design["status"] == 200 and "「" in json.dumps(design["json"], ensure_ascii=False))
+        missing_guide = await api.call("GET", "/api/v1/guides/gibtsnicht")
+        check("Unbekannter Guide → 404", missing_guide["status"] == 404)
+
+        # ── 5. Setup mit Mention-Auflösung + Persona + Purge ───────────────
+        plan = {
+            "roles": [{"key": "gamer", "name": "「🎮」 Gamer", "color": "#5865F2",
+                       "permissions": ["view_channel", "send_messages"]}],
+            "categories": [{
+                "key": "info", "name": "「📌」 INFORMATION",
+                "overwrites": [{"id": "@everyone", "deny": ["send_messages"]}],
+                "channels": [{"key": "regeln", "name": "「✦」regeln", "type": "text"}],
+            }],
+            "messages": [
+                {"channel": "regeln", "pin": True,
+                 "webhook": {"name": "📜 Serverregeln"},
+                 "content": " Lies <#regeln> — Mitglied: <@&gamer>!"},
+            ],
+        }
+        result = await api.call("POST", "/api/v1/setup", body=plan)
+        check("Mini-Setup mit Persona + Mention → 200", result["status"] == 200,
+              str(result["json"])[:400])
+        data = result["json"].get("data", {})
+        check("Mini-Setup ohne Fehlschritt", data.get("steps_failed") == 0,
+              json.dumps([r for r in data.get("report", []) if not r.get("ok")],
+                         ensure_ascii=False)[:300])
+        channel_id = data.get("keys", {}).get("regeln")
+        role_id = data.get("keys", {}).get("gamer")
+        contents = [m.content for m in guild.sent_messages
+                    if getattr(m.channel, "id", None) == int(channel_id or 0)]
+        check("<#key>-Mention wurde zu echter Kanal-Mention",
+              any(f"<#{channel_id}>" in c for c in contents), str(contents))
+        check("<@&key>-Rollen-Mention wurde echt",
+              any(f"<@&{role_id}>" in c for c in contents), str(contents))
+        check("Persona im Setup gesendet",
+              any(m.startswith("webhook.send:") for m in guild.mutations[-6:]))
+        check("Nachricht angepinnt", any(getattr(m, "pinned", False)
+                                         for m in guild.sent_messages))
+
+        # Purge vor dem Erneuern: alte Nachrichten weg
+        purge = await api.call("POST", f"/api/v1/channels/{channel_id}/purge",
+                               body={"bots_only": True, "confirm": True, "limit": 50})
+        check("Purge vor Erneuerung → 200", purge["status"] == 200, str(purge["json"])[:300])
+        check("Purge löscht die Persona-Nachrichten",
+              purge["json"]["data"]["deleted_count"] >= 1,
+              str(purge["json"]["data"]["deleted_count"]))
+        no_confirm = await api.call("POST", f"/api/v1/channels/{channel_id}/purge",
+                                    body={"limit": 10})
+        check("Purge ohne confirm → CONFIRM_REQUIRED",
+              no_confirm["status"] == 400
+              and no_confirm["json"]["error"]["code"] == "CONFIRM_REQUIRED")
+
+        # Platzhalter-Validation schlägt an
+        preview = await api.call("POST", "/api/v1/setup/preview", body={
+            "messages": [{"channel": "regeln", "content": "Siehe <#gibts-nicht>"}]})
+        warnings = json.dumps(preview["json"].get("data", {}).get("warnings") or [],
+                              ensure_ascii=False)
+        check("Preview warnt vor unauflösbarem Platzhalter",
+              "gibts-nicht" in warnings, warnings[:200])
+    finally:
+        client.swap_guild(_standard_guild())
+
+
+async def t_prompt(h: Harness) -> None:
+    """Die Prompt-Varianten müssen die Upgrade-Regeln transportieren."""
+    print("── Prompt-Inhalte (Hygiene, Personas, Branding, Grenzen) ────")
+    api = h.api("danger")
+
+    short = await api.call("GET", "/api/v1/prompt?variant=short&format=text")
+    text = short["text"]
+    check("Short-Prompt passt in einen Discord-Codeblock (<1900)",
+          short["status"] == 200 and len(text) < 1900, f"{len(text)} Zeichen")
+    for phrase in ("purge", "webhook", "members/me", "guides/self-roles",
+                   "Platzhalter", "「✦」", "overwrites", "Unicode"):
+        check(f"Short-Prompt nennt '{phrase}'", phrase.lower() in text.lower())
+
+    long = (await api.call("GET", "/api/v1/prompt?variant=long&format=text"))["text"]
+    check("Long-Prompt erklärt Personen & Bot-Avatar",
+          "members/me" in long and "webhook" in long.lower())
+    check("Long-Prompt enthält Guides & Endpunkt-Tabelle",
+          "guides" in long and "/api/v1/webhooks" in long)
+    check("Long-Prompt hat Hygiene-Abschnitt", "Nachrichten-Hygiene" in long)
+
+    system = (await api.call("GET", "/api/v1/prompt?variant=system&format=text"))["text"]
+    check("System-Prompt kompakt (<2200) und mit Regeln",
+          len(system) < 2200 and "members/me" in system and "purge" in system,
+          f"{len(system)} Zeichen")
+
+    caps = await api.call("GET", "/api/v1/capabilities")
+    conventions = json.dumps(caps["json"]["data"].get("conventions", {}), ensure_ascii=False)
+    for key in ("webhook_first", "cleanup_before_repost", "mentions_no_placeholders",
+                "unicode_design", "third_party_bots"):
+        check(f"capabilities.conventions nennt '{key}'", key in conventions)
 
 
 async def t_session_limit(h: Harness) -> None:
@@ -720,8 +900,8 @@ async def run_tests() -> int:
     groups = (
         ("public", t_public), ("auth", t_auth), ("read", t_read), ("scopes", t_scopes),
         ("errors", t_errors), ("setup", t_setup), ("lifecycle", t_session_lifecycle),
-        ("ratelimit", t_ratelimit), ("write", t_write), ("limit", t_session_limit),
-        ("security", t_security),
+        ("ratelimit", t_ratelimit), ("write", t_write), ("arena", t_arena),
+        ("prompt", t_prompt), ("limit", t_session_limit), ("security", t_security),
     )
     selected = [g for g in sys.argv[1:] if not g.startswith("-")] or [name for name, _ in groups]
 

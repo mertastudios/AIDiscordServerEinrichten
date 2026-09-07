@@ -202,8 +202,88 @@ async def member_me(ctx: Ctx) -> Dict[str, Any]:
                                 code="BOT_MEMBER_MISSING")
     data = serialize_member(me) or {}
     data["top_role_position"] = me.top_role.position
-    data["note"] = "Rollen mit position >= top_role_position kann der Bot NICHT verwalten."
+    data["note"] = (
+        "Rollen mit position >= top_role_position kann der Bot NICHT verwalten. "
+        "Server-Profil (Nickname, Avatar, Banner, Bio) ändern: "
+        "PATCH /api/v1/members/me — der Avatar gilt NUR für diesen Server."
+    )
     return data
+
+
+async def apply_bot_profile(ctx: Ctx, data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Kernlogik von ``PATCH /api/v1/members/me`` — auch vom Setup-Wizard nutzbar.
+
+    Ändert das Server-Profil des Bots selbst: Nickname, **Server-Avatar**,
+    Server-Banner und Bio. Laut Discord-API dürfen genau diese Felder nur am
+    eigenen Mitglied gesetzt werden — deshalb der dedizierte Endpoint (der
+    generische ``PATCH /api/v1/members/{id}`` lehnt Self-Edits ab).
+    """
+    me = ctx.guild.me
+    if me is None:
+        raise ApiError.conflict("Der Bot ist auf diesem Server nicht als Mitglied zwischengespeichert.",
+                                code="BOT_MEMBER_MISSING")
+    kwargs: Dict[str, Any] = {}
+    changes: List[str] = []
+
+    if "nick" in data or "nickname" in data:
+        nick = data.get("nick", data.get("nickname"))
+        if nick is None or (isinstance(nick, str) and not nick.strip()):
+            kwargs["nick"] = None
+            changes.append("nick → entfernt")
+        else:
+            kwargs["nick"] = parse_str(nick, field="nick", min_length=1, max_length=32,
+                                       allow_empty=False)
+            changes.append(f"nick → {kwargs['nick']}")
+
+    for key in ("avatar", "banner"):
+        if key in data:
+            kwargs[key] = await resolve_image(data[key], session=ctx.http_session(), field=key)
+            changes.append(f"{key} → {'entfernt' if kwargs[key] is None else 'gesetzt'}")
+
+    if "bio" in data:
+        kwargs["bio"] = parse_str(data["bio"], field="bio", max_length=190)
+        changes.append("bio → gesetzt")
+
+    if not kwargs:
+        raise ApiError.bad_request(
+            "Nichts zu tun: 'nick', 'avatar', 'banner' und/oder 'bio' angeben.",
+            code="NO_CHANGES",
+        )
+    kwargs["reason"] = ctx.reason(data, default="Bot-Profil aktualisiert (Arena AI)")
+    await guard(me.edit(**kwargs), action="Bot-Profil bearbeiten")
+    await ctx.settle(0.5)
+    fresh = ctx.guild.get_member(me.id) or me
+    result = serialize_member(fresh) or {}
+    result["changed"] = changes
+    result["hint"] = ("avatar/banner/bio gelten nur für DIESEN Server — das globale "
+                      "Bot-Profil bleibt unverändert.")
+    return result
+
+
+@route(
+    "PATCH", "/api/v1/members/me", scope="write", tags=("members", "meta"),
+    summary="Server-Profil des Bots selbst ändern (Nickname, Avatar, Banner, Bio)",
+    body={
+        "nick": "str | null — Server-Nickname, z. B. '✨ Server-Assistent'",
+        "avatar": "URL/Data-URI | null — Server-Profilbild des Bots (nur dieser Server!)",
+        "banner": "URL/Data-URI | null — Server-Banner des Bots",
+        "bio": "str | null — Über mich (Server-Profil)",
+        "reason": "str",
+    },
+    description="Der Klassiker fürs Branding: Der Bot bekommt auf diesem Server "
+                "einen eigenen Namen und ein eigenes Profilbild — unabhängig von "
+                "seinem globalen Auftritt. Discord erlaubt avatar/banner/bio "
+                "ausschließlich am eigenen Mitglied, deshalb existiert dieser "
+                "Endpoint separat zu PATCH /api/v1/members/{id}.",
+    examples=[
+        {"body": {"nick": "✨ Setup-Assistent",
+                  "avatar": "https://example.com/bot-avatar.png"}},
+    ],
+)
+async def patch_member_me(ctx: Ctx) -> Dict[str, Any]:
+    data = await ctx.body()
+    return await apply_bot_profile(ctx, data)
 
 
 @route(
@@ -388,7 +468,9 @@ async def patch_member(ctx: Ctx) -> Dict[str, Any]:
 
     if member.id == (ctx.client.user.id if ctx.client.user else 0):
         raise ApiError.bad_request(
-            "Der Bot kann sich nicht selbst bearbeiten (Timeout/Rollen-Konflikte).",
+            "Der Bot kann sich hier nicht selbst bearbeiten (Timeout/Rollen-Konflikte).",
+            hint="Für das eigene Server-Profil (Nickname, Avatar, Banner, Bio) den "
+                 "dedizierten Endpoint nutzen: PATCH /api/v1/members/me.",
             code="SELF_TARGET",
         )
     if member.id == guild.owner_id and any(

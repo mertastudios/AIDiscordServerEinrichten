@@ -33,6 +33,7 @@ Server-Vorlagen, die die KI nur noch anpassen muss.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any, Dict, List, Mapping, Optional
 
 import discord
@@ -60,17 +61,18 @@ MAX_ITEMS = 60
 
 def _template_gaming() -> Dict[str, Any]:
     return {
-        "beschreibung": "Klassische Gaming-Community mit Voice-Lounges, LFG und Turnieren.",
+        "beschreibung": "Klassische Gaming-Community mit Voice-Lounges, LFG und Turnieren — "
+                        "im Unicode-Design, Nachrichten als Webhook-Personen.",
         "roles": [
-            {"key": "owner", "name": "👑 Owner", "color": "#E74C3C", "hoist": True,
+            {"key": "owner", "name": "「👑」 Owner", "color": "#E74C3C", "hoist": True,
              "permissions": ["administrator"], "position": 20},
-            {"key": "admin", "name": "🛠️ Admin", "color": "#E67E22", "hoist": True,
+            {"key": "admin", "name": "「🛠️」 Admin", "color": "#E67E22", "hoist": True,
              "permissions": ["manage_guild", "manage_channels", "manage_roles", "manage_messages",
                              "kick_members", "ban_members", "moderate_members", "view_audit_log",
                              "manage_webhooks", "manage_expressions", "manage_events"], "position": 18},
             {"key": "mod", "preset": "moderator", "position": 16},
             {"key": "vip", "preset": "vip", "position": 12},
-            {"key": "gamer", "name": "🎮 Gamer", "color": "#5865F2", "hoist": True,
+            {"key": "gamer", "name": "「🎮」 Gamer", "color": "#5865F2", "hoist": True,
              "permissions": ["view_channel", "send_messages", "read_message_history", "connect",
                              "speak", "stream", "use_voice_activation", "add_reactions",
                              "attach_files", "embed_links", "create_instant_invite",
@@ -80,41 +82,41 @@ def _template_gaming() -> Dict[str, Any]:
             {"key": "muted", "preset": "muted", "position": 2},
         ],
         "categories": [
-            {"key": "info", "name": "📌 INFORMATION", "position": 0,
+            {"key": "info", "name": "「📌」 INFORMATION", "position": 0,
              "overwrites": [{"id": "@everyone", "deny": ["send_messages", "add_reactions"]}],
              "channels": [
-                 {"key": "regeln", "name": "regeln", "type": "text",
+                 {"key": "regeln", "name": "「✦」regeln", "type": "text",
                   "topic": "Serverregeln — bitte zuerst lesen!"},
-                 {"key": "news", "name": "ankündigungen", "type": "announcement",
+                 {"key": "news", "name": "「✦」ankündigungen", "type": "announcement",
                   "topic": "Wichtige Neuigkeiten"},
-                 {"key": "welcome", "name": "willkommen", "type": "text",
+                 {"key": "welcome", "name": "「✦」willkommen", "type": "text",
                   "topic": "Neue Mitglieder"},
-                 {"key": "roles", "name": "rollen-wahl", "type": "text",
+                 {"key": "roles", "name": "「✦」rollen-wahl", "type": "text",
                   "topic": "Such dir deine Rollen"}]},
-            {"key": "community", "name": "💬 COMMUNITY", "position": 1,
+            {"key": "community", "name": "「💬」 COMMUNITY", "position": 1,
              "channels": [
-                 {"key": "chat", "name": "allgemein", "type": "text", "slowmode_delay": 3,
+                 {"key": "chat", "name": "✦・allgemein", "type": "text", "slowmode_delay": 3,
                   "topic": "Hauptchat für alles"},
-                 {"name": "memes", "type": "text", "topic": "Nur die besten Memes"},
-                 {"name": "clips", "type": "forum", "topic": "Teile deine besten Momente",
+                 {"name": "✦・memes", "type": "text", "topic": "Nur die besten Memes"},
+                 {"name": "✦・clips", "type": "forum", "topic": "Teile deine besten Momente",
                   "available_tags": ["Highlight", "Fail", "Clip"]},
-                 {"name": "bilder", "type": "text", "topic": "Screenshots & Fotos"},
-                 {"name": "bot-commands", "type": "text", "topic": "Nur für Bots"}]},
-            {"key": "gaming", "name": "🎮 GAMING", "position": 2,
+                 {"name": "✦・bilder", "type": "text", "topic": "Screenshots & Fotos"},
+                 {"name": "✦・bot-commands", "type": "text", "topic": "Nur für Bots"}]},
+            {"key": "gaming", "name": "「🎮」 SPIELE", "position": 2,
              "channels": [
-                 {"name": "lfg-suche", "type": "text",
+                 {"name": "✦・lfg-suche", "type": "text",
                   "topic": "Mitspieler gesucht? Hier posten!"},
-                 {"name": "valorant", "type": "text"},
-                 {"name": "minecraft", "type": "text"},
-                 {"name": "turniere", "type": "announcement", "topic": "Turnier-Ankündigungen"}]},
-            {"key": "voice", "name": "🔊 SPRACHKANÄLE", "position": 3,
+                 {"name": "✦・valorant", "type": "text"},
+                 {"name": "✦・minecraft", "type": "text"},
+                 {"name": "「📣」turniere", "type": "announcement", "topic": "Turnier-Ankündigungen"}]},
+            {"key": "voice", "name": "「🔊」 SPRACHE", "position": 3,
              "channels": [
-                 {"name": "Lounge", "type": "voice", "user_limit": 0},
-                 {"name": "Gaming 1", "type": "voice", "user_limit": 10},
-                 {"name": "Gaming 2", "type": "voice", "user_limit": 10},
-                 {"name": "Duo", "type": "voice", "user_limit": 2},
-                 {"name": "AFK", "type": "voice", "user_limit": 0}]},
-            {"key": "team", "name": "🔒 TEAM INTERN", "position": 4,
+                 {"name": "「🎧」 Lounge", "type": "voice", "user_limit": 0},
+                 {"name": "「🎧」 Gaming 1", "type": "voice", "user_limit": 10},
+                 {"name": "「🎧」 Gaming 2", "type": "voice", "user_limit": 10},
+                 {"name": "「🎧」 Duo", "type": "voice", "user_limit": 2},
+                 {"name": "「🎧」 AFK", "type": "voice", "user_limit": 0}]},
+            {"key": "team", "name": "「🔒」 TEAM INTERN", "position": 4,
              "overwrites": [
                  {"id": "@everyone", "deny": ["view_channel"]},
                  {"role_key": "mod", "allow": ["view_channel", "send_messages", "read_message_history",
@@ -122,14 +124,16 @@ def _template_gaming() -> Dict[str, Any]:
                                                "connect", "speak"]},
                  {"role_key": "admin", "allow": ["view_channel", "send_messages", "manage_messages"]}],
              "channels": [
-                 {"name": "team-chat", "type": "text", "topic": "Nur für das Team"},
-                 {"name": "mod-log", "type": "text", "topic": "Automatische Moderations-Logs"},
-                 {"name": "Team-Besprechung", "type": "voice"}]},
+                 {"name": "✦・team-chat", "type": "text", "topic": "Nur für das Team"},
+                 {"name": "✦・mod-log", "type": "text", "topic": "Automatische Moderations-Logs"},
+                 {"name": "「🎧」 Team-Besprechung", "type": "voice"}]},
         ],
         "settings": {"system_channel": "welcome", "rules_channel": "regeln",
                      "afk_channel": "AFK", "afk_timeout": 900},
+        "bot_profile": {"nick": "✨ Server-Assistent"},
         "messages": [
-            {"channel": "regeln",
+            {"channel": "regeln", "pin": True,
+             "webhook": {"name": "📜 Serverregeln"},
              "embeds": [{"title": "📜 Serverregeln", "color": "#E74C3C",
                          "description": "Mit dem Beitritt akzeptierst du diese Regeln.",
                          "fields": [
@@ -145,10 +149,22 @@ def _template_gaming() -> Dict[str, Any]:
                                                            "bindend.", "inline": False}],
                          "footer": {"text": "Verstöße führen zu Timeout, Kick oder Ban."}}]},
             {"channel": "welcome",
+             "webhook": {"name": "🎉 Willkommens-Team"},
              "embeds": [{"title": "👋 Willkommen!", "color": "#5865F2",
                          "description": "Schön, dass du da bist! Lies zuerst <#regeln> "
-                                        "und hol dir in <#rollen-wahl> deine Rollen.",
+                                        "und schau in <#rollen-wahl> vorbei.",
                          "footer": {"text": "Viel Spaß auf dem Server"}}]},
+            {"channel": "roles", "pin": True,
+             "webhook": {"name": "🎨 Rollen-Team"},
+             "embeds": [{"title": "🎨 Rollen selbst auswählen", "color": "#F1C40F",
+                         "description": "Hier kannst du dir eigene Rollen holen — zum Beispiel "
+                                        "<@&gamer>. \n\n"
+                                        "**Ehrlich gesagt:** Die Reaktions-Auswahl selbst "
+                                        "übernimmt ein Rollen-Bot, und Bots dürfen andere Bots "
+                                        "nicht konfigurieren (Discord-Regel). Die 3-Minuten-"
+                                        "Anleitung dafür folgt direkt im Chat — die Rollen, "
+                                        "dieser Kanal und die Einrichtung sind bereits fertig. ✅",
+                         "footer": {"text": "Anleitung kommt vom Server-Team / Arena AI"}}]},
         ],
         "automod": [
             {"name": "Keine Fremd-Werbung", "trigger_type": "keyword",
@@ -379,10 +395,10 @@ def _template_friends() -> Dict[str, Any]:
                      "Schön, dass du da bist. Hier ist alles — kein Regelwerk, "
                      "nur ein bisschen Rücksicht.\n\n"
                      "**Text**\n"
-                     "> #chat — alles Mögliche\n"
-                     "> #bilder — Memes, Fotos, Fundstücke\n"
-                     "> #musik — was gerade läuft\n"
-                     "> #games — Verabredungen zum Zocken\n\n"
+                     "> <#chat> — alles Mögliche\n"
+                     "> <#bilder> — Memes, Fotos, Fundstücke\n"
+                     "> <#musik> — was gerade läuft\n"
+                     "> <#games> — Verabredungen zum Zocken\n\n"
                      "**Voice**\n"
                      "> 🔊 Wohnzimmer — einfach reinsetzen\n"
                      "> 🔊 Gaming — max. 6 Leute\n\n"
@@ -394,8 +410,117 @@ def _template_friends() -> Dict[str, Any]:
     }
 
 
+def _template_aesthetic() -> Dict[str, Any]:
+    return {
+        "beschreibung": "Design-Server mit Unicode-Stil (「✦」, ・, ꒰꒱): für Communities, "
+                        "die besonders aussehen wollen. Webhook-Personen überall.",
+        "roles": [
+            {"key": "owner", "name": "꒰👑꒱ Owner", "color": "#9B59B6", "hoist": True,
+             "permissions": ["administrator"], "position": 20},
+            {"key": "mod", "preset": "moderator", "position": 16},
+            {"key": "vip", "name": "꒰⭐꒱ VIP", "color": "#F1C40F", "hoist": True,
+             "permissions": ["view_channel", "send_messages", "read_message_history",
+                             "embed_links", "attach_files", "add_reactions",
+                             "use_external_emojis", "use_external_stickers",
+                             "connect", "speak", "stream", "priority_speaker",
+                             "create_instant_invite", "use_application_commands"],
+             "position": 12},
+            {"key": "member", "preset": "mitglied", "position": 4},
+            {"key": "bot", "preset": "bot", "position": 14},
+            {"key": "muted", "preset": "muted", "position": 2},
+        ],
+        "categories": [
+            {"key": "start", "name": "❖ ✧ WILLKOMMEN ✧ ❖", "position": 0,
+             "overwrites": [{"id": "@everyone", "deny": ["send_messages", "add_reactions"]}],
+             "channels": [
+                 {"key": "regeln", "name": "「✦」regeln", "type": "text",
+                  "topic": "Die Regeln — kurz, fair, verbindlich"},
+                 {"key": "news", "name": "「📣」news", "type": "announcement",
+                  "topic": "Alles Wichtige auf einen Blick"},
+                 {"key": "intro", "name": "「✦」vorstellung", "type": "text",
+                  "topic": "Stell dich kurz vor 💬"}]},
+            {"key": "community", "name": "❖ ✧ COMMUNITY ✧ ❖", "position": 1,
+             "channels": [
+                 {"key": "chat", "name": "✦・chat", "type": "text", "slowmode_delay": 3,
+                  "topic": "Der Hauptchat"},
+                 {"name": "✦・memes", "type": "text", "topic": "Humor-Bereich"},
+                 {"name": "✦・galerie", "type": "text", "topic": "Bilder & Ästhetik"},
+                 {"name": "✦・off-topic", "type": "text", "topic": "Alles andere"},
+                 {"name": "「💬」forum", "type": "forum", "topic": "Diskussionen in Threads",
+                  "available_tags": ["Frage", "Diskussion", "Umfrage"]}]},
+            {"key": "roles", "name": "❖ ✧ ROLLEN ✧ ❖", "position": 2,
+             "overwrites": [{"id": "@everyone", "deny": ["send_messages"]}],
+             "channels": [
+                 {"key": "rollen", "name": "「🎨」rollen-wahl", "type": "text",
+                  "topic": "Such dir deine Rollen"}]},
+            {"key": "voice", "name": "❖ ✧ VOICE ✧ ❖", "position": 3,
+             "channels": [
+                 {"name": "「🎧」 Lounge", "type": "voice", "user_limit": 0},
+                 {"name": "「🎧」 Chill", "type": "voice", "user_limit": 8},
+                 {"name": "「🎧」 Gaming", "type": "voice", "user_limit": 10},
+                 {"name": "「🎧」 AFK", "type": "voice", "user_limit": 0}]},
+            {"key": "team", "name": "「🔒」 TEAM", "position": 4,
+             "overwrites": [
+                 {"id": "@everyone", "deny": ["view_channel"]},
+                 {"role_key": "mod", "allow": ["view_channel", "send_messages",
+                                               "read_message_history", "connect", "speak"]}],
+             "channels": [
+                 {"name": "✦・team-chat", "type": "text", "topic": "Intern"},
+                 {"name": "✦・mod-log", "type": "text", "topic": "Moderations-Logs"}]},
+        ],
+        "settings": {"system_channel": "intro", "rules_channel": "regeln",
+                     "afk_channel": "AFK", "afk_timeout": 900},
+        "bot_profile": {"nick": "✨ Server-Assistent"},
+        "messages": [
+            {"channel": "regeln", "pin": True,
+             "webhook": {"name": "📜 Regeln"},
+             "embeds": [{"title": "✦ Die Regeln ✦", "color": "#9B59B6",
+                         "description": "Respekt ist alles. Der Rest ergibt sich.",
+                         "fields": [
+                             {"name": "01 · Respekt", "value": "Kein Hate, keine Belästigung.",
+                              "inline": False},
+                             {"name": "02 · Sprache", "value": "Bleib freundlich, auch in "
+                              "Diskussionen.", "inline": False},
+                             {"name": "03 · Inhalt", "value": "Kein NSFW, keine Werbung.",
+                              "inline": False},
+                             {"name": "04 · Melden", "value": "Probleme? Team anschreiben — "
+                              "<@&mod> hilft.", "inline": False}],
+                         "footer": {"text": "Mit dem Betreten akzeptierst du die Regeln."}}]},
+            {"channel": "intro", "pin": True,
+             "webhook": {"name": "✨ Willkommens-Team"},
+             "embeds": [{"title": "꒰✨꒱ Willkommen!", "color": "#F1C40F",
+                         "description": "Schön, dass du da bist!\n\n"
+                                        "▸ Erst <#regeln> lesen\n"
+                                        "▸ Dann in <#rollen> Rollen abholen\n"
+                                        "▸ Und los geht's in <#chat>",
+                         "footer": {"text": "Dein Team wünscht viel Spaß ✦"}}]},
+            {"channel": "rollen", "pin": True,
+             "webhook": {"name": "🎨 Rollen-Team"},
+             "embeds": [{"title": "꒰🎨꒱ Deine Rollen", "color": "#2ECC71",
+                         "description": "Hier kannst du dir Rollen wie <@&vip> selbst "
+                                        "geben.\n\n**Ehrliche Info:** Die Reaktions-Auswahl "
+                                        "macht ein Rollen-Bot — Bots dürfen andere Bots nicht "
+                                        "konfigurieren (Discord-Regel). Rollen, Kanal und Optik "
+                                        "sind fertig; die 3-Minuten-Anleitung für die "
+                                        "Aktivierung folgt im Chat. ✅"}]},
+        ],
+        "automod": [
+            {"name": "Werbung blockieren", "trigger_type": "keyword",
+             "regex_patterns": ["discord\\.(gg|com|me)/\\w+"],
+             "actions": [{"type": "block_message"},
+                         {"type": "send_alert_message", "channel": "mod-log"}],
+             "exempt_roles": ["mod"]},
+            {"name": "Beleidigungen", "trigger_type": "keyword_preset",
+             "presets": ["profanity", "slurs"],
+             "actions": [{"type": "block_message"}, {"type": "timeout", "duration": "10m"}],
+             "exempt_roles": ["mod"]},
+        ],
+    }
+
+
 SETUP_TEMPLATES: Dict[str, Dict[str, Any]] = {
     "gaming-community": _template_gaming(),
+    "aesthetic-community": _template_aesthetic(),
     "creator-streamer": _template_creator(),
     "lerngruppe": _template_study(),
     "business-support": _template_business(),
@@ -405,7 +530,7 @@ SETUP_TEMPLATES: Dict[str, Dict[str, Any]] = {
 
 @route(
     "GET", "/api/v1/setup/templates", scope="read", tags=("setup",),
-    summary="Fertige Server-Vorlagen (Gaming, Creator, Lerngruppe, Business, Freunde)",
+    summary="Fertige Server-Vorlagen (Gaming, Aesthetic, Creator, Lerngruppe, Business, Freunde)",
     query={"name": "eine Vorlage im Detail", "list": "true — nur Namen + Beschreibung"},
     description="Jede Vorlage ist ein kompletter, direkt ausführbarer Setup-Plan. "
                 "Empfohlener Ablauf: Vorlage holen → an die Wünsche des Nutzers "
@@ -459,10 +584,11 @@ async def setup_preview(ctx: Ctx) -> Dict[str, Any]:
             "4. Kanäle ohne Kategorie",
             "5. Server-Einstellungen (system/rules/afk/community)",
             "6. Willkommensbildschirm",
-            "7. Nachrichten posten",
-            "8. Invites erstellen",
-            "9. AutoMod-Regeln",
-            "10. Rollen-Positionen final justieren",
+            "7. Bot-Profil (Nickname/Avatar — 'bot_profile')",
+            "8. Nachrichten posten (als Webhook-Personen, Mentions werden aufgelöst)",
+            "9. Invites erstellen",
+            "10. AutoMod-Regeln",
+            "11. Rollen-Positionen final justieren",
         ],
         "hint": "POST /api/v1/setup führt denselben Plan wirklich aus.",
     }
@@ -472,18 +598,22 @@ async def setup_preview(ctx: Ctx) -> Dict[str, Any]:
     "POST", "/api/v1/setup", scope="write", tags=("setup",),
     summary="Komplettes Server-Setup in EINEM Aufruf",
     body={
-        "template": "'gaming-community'|'creator-streamer'|'lerngruppe'|'business-support'|"
-                    "'freunde' — wird mit den anderen Feldern gemischt",
-        "guild": "{…} — wie PATCH /api/v1/guild (name, verification_level, community …)",
-        "roles": '[{"key":"mod","name":"🛡️ Mod","preset":"moderator","color":"#3498DB",'
+        "template": "'gaming-community'|'aesthetic-community'|'creator-streamer'|'lerngruppe'|"
+                    "'business-support'|'freunde' — wird mit den anderen Feldern gemischt",
+        "guild": "{…} — wie PATCH /api/v1/guild (name, icon, banner, verification_level, community …)",
+        "roles": '[{"key":"mod","name":"「🛡️」 Mod","preset":"moderator","color":"#3498DB",'
                  '"permissions":[…],"position":16}]',
-        "categories": '[{"key":"info","name":"📌 INFO","position":0,"overwrites":[…],'
+        "categories": '[{"key":"info","name":"「📌」 INFORMATION","position":0,"overwrites":[…],'
                       '"channels":[{…}]}]',
         "channels": '[{…}] — Kanäle ohne Kategorie',
         "settings": '{"system_channel":"welcome","rules_channel":"regeln",'
                     '"afk_channel":"AFK","afk_timeout":900,"public_updates_channel":"…"}',
         "welcome": '{"enabled":true,"description":"…","welcome_channels":[…]}',
-        "messages": '[{"channel":"regeln","content":"…","embeds":[…],"components":[[…]]}]',
+        "bot_profile": '{"nick":"✨ Assistent","avatar":"https://…","banner":"…","bio":"…"} '
+                       "— Server-Profil des Bots",
+        "messages": '[{"channel":"regeln","webhook":{"name":"📜 Regeln","avatar":"https://…"},'
+                    '"pin":true,"content":"…","embeds":[…],"components":[[…]]}] — webhook/pin optional; '
+                    "<#key>-Mentions werden automatisch zu echten Kanal-Mentions aufgelöst",
         "invites": '[{"channel":"chat","max_age":0,"max_uses":0}]',
         "automod": '[{"name":"…","trigger_type":"keyword","keyword_filter":[…],"actions":[…]}]',
         "delay_ms": "int — Pause zwischen Discord-Aufrufen (Standard 350)",
@@ -491,11 +621,12 @@ async def setup_preview(ctx: Ctx) -> Dict[str, Any]:
         "reason": "str",
     },
     description="Referenzen auf noch nicht existierende Objekte laufen über ``key``. "
-                "Jeder Schritt wird protokolliert; Einzelfehler brechen den Rest nicht ab.",
+                "Jeder Schritt wird protokolliert; Einzelfehler brechen den Rest nicht ab. "
+                "Regeln/Infos werden als Webhook-Persona gesendet und angepinnt.",
     examples=[
         {"body": {
-            "template": "gaming-community",
-            "guild": {"name": "Mein Gaming Server", "verification_level": "medium"},
+            "template": "aesthetic-community",
+            "guild": {"name": "Mein Server", "verification_level": "medium"},
             "reason": "Grundsetup durch Arena AI",
         }},
     ],
@@ -542,7 +673,8 @@ async def setup(ctx: Ctx) -> Dict[str, Any]:
     keys: Dict[str, Any] = {}
     report: List[Dict[str, Any]] = []
     created: Dict[str, Any] = {"roles": [], "categories": [], "channels": [], "messages": [],
-                               "invites": [], "automod": [], "settings": None}
+                               "invites": [], "automod": [], "settings": None,
+                               "bot_profile": None, "webhooks": []}
     aborted: Optional[str] = None
 
     def step(name: str, ok: bool, *, detail: Any = None, error: Optional[ApiError] = None) -> bool:
@@ -763,6 +895,22 @@ async def setup(ctx: Ctx) -> Dict[str, Any]:
         except ApiError as exc:
             step("welcome", False, error=exc)
 
+    # ── 6b. Bot-Profil (Nickname/Avatar/Banner/Bio auf diesem Server) ───────
+    bot_profile = plan.get("bot_profile")
+    if bot_profile and not aborted:
+        if not isinstance(bot_profile, dict):
+            step("bot_profile", False, detail="bot_profile muss ein Objekt sein.")
+        else:
+            try:
+                from .members import apply_bot_profile
+
+                sub = await apply_bot_profile(ctx, dict(bot_profile))
+                step("bot_profile", True, detail=sub.get("changed"))
+                created["bot_profile"] = sub.get("changed")
+                await pause()
+            except ApiError as exc:
+                step("bot_profile", False, error=exc)
+
     # ── 7. Nachrichten ───────────────────────────────────────────────────────
     for index, msg_spec in enumerate(plan.get("messages") or []):
         if aborted:
@@ -780,15 +928,39 @@ async def setup(ctx: Ctx) -> Dict[str, Any]:
                     code="CHANNEL_TYPE_MISMATCH",
                 )
             from ..message_ops import build_message_kwargs
+            from ..webhook_ops import (normalize_webhook_spec, resolve_placeholders_deep,
+                                       send_as_webhook)
 
-            kwargs, _notes = await build_message_kwargs(msg_spec, ctx=ctx, channel=channel)
-            message = await guard(channel.send(**kwargs),
-                                  action=f"Setup-Nachricht in '{channel.name}' senden")
+            # <#key>-Mentions in content/embeds durch echte Kanal-Mentions ersetzen —
+            # Platzhalter dürfen niemals im Kanal landen.
+            resolved_spec = resolve_placeholders_deep(msg_spec, guild, keys)
+            kwargs, _notes = await build_message_kwargs(resolved_spec, ctx=ctx, channel=channel)
+
+            webhook_spec = normalize_webhook_spec(resolved_spec)
+            if webhook_spec is not None:
+                message, _hook_notes = await send_as_webhook(
+                    channel, webhook_spec, kwargs, reason=reason
+                )
+                via = "webhook"
+                created["webhooks"].append({"channel": channel.name, "persona": webhook_spec.get("name")})
+            else:
+                message = await guard(channel.send(**kwargs),
+                                      action=f"Setup-Nachricht in '{channel.name}' senden")
+                via = "bot"
+
+            pinned = False
+            if parse_bool(resolved_spec.get("pin"), field="pin", default=False) \
+                    and hasattr(message, "pin"):
+                await guard(message.pin(), action=f"Nachricht in '{channel.name}' anpinnen")
+                pinned = True
+
             await ctx.settle(0.3)
             created["messages"].append({"channel": channel.name, "channel_id": sf(channel.id),
-                                        "message_id": sf(message.id),
+                                        "message_id": sf(message.id), "via": via,
+                                        "pinned": pinned,
                                         "preview": serialize_message(message, detailed=False)})
-            step(f"{label}:#{channel.name}", True, detail={"message_id": sf(message.id)})
+            step(f"{label}:#{channel.name}", True,
+                 detail={"message_id": sf(message.id), "via": via, "pinned": pinned})
         except ApiError as exc:
             step(f"{label}", False, error=exc)
             if stop_on_error:
@@ -903,6 +1075,9 @@ async def setup(ctx: Ctx) -> Dict[str, Any]:
         "next_steps": [
             "GET /api/v1/guild/snapshot — Ergebnis verifizieren",
             "GET /api/v1/channels/tree — Struktur prüfen",
+            "PATCH /api/v1/guild — Branding (icon/banner), falls noch nicht gesetzt",
+            "PATCH /api/v1/members/me — Bot-Avatar/-Nickname für diesen Server",
+            "GET /api/v1/guides/self-roles — falls Rollen-Wahl gewünscht: Anleitung posten",
             "PATCH /api/v1/channels/positions — Feinschliff der Reihenfolge",
         ],
     }
@@ -976,6 +1151,11 @@ def _validate_plan(guild: discord.Guild, plan: Dict[str, Any]) -> Dict[str, List
             continue
         if not cat.get("name"):
             err(f"{where}.name", "fehlt")
+        if not cat.get("overwrites"):
+            warn(f"{where}.overwrites",
+                 "Kategorie ohne Berechtigungen — @everyone sollte z. B. in Info-Bereichen "
+                 "send_messages verweigert bekommen. Auch 'team'/'intern' braucht deny "
+                 "view_channel.")
         for ch_index, channel in enumerate(cat.get("channels") or []):
             total_channels += 1
             _validate_channel(f"{where}.channels[{ch_index}]", channel, err)
@@ -988,6 +1168,33 @@ def _validate_plan(guild: discord.Guild, plan: Dict[str, Any]) -> Dict[str, List
     if len(plan.get("roles") or []) > 250:
         warn("roles", "Discord erlaubt maximal 250 Rollen pro Server.")
 
+    for index, spec in enumerate(plan.get("roles") or []):
+        if isinstance(spec, dict) and spec.get("permissions") is None \
+                and not spec.get("preset") and not _find_existing_role(guild, spec):
+            warn(f"roles[{index}].permissions",
+                 f"Rolle '{spec.get('name')}' ohne explizite Rechte — lieber gezielt "
+                 "setzen (z. B. ['view_channel','send_messages','read_message_history']) "
+                 "oder ein 'preset' nutzen.")
+
+    if plan.get("bot_profile") is not None and not isinstance(plan.get("bot_profile"), dict):
+        err("bot_profile", "muss ein Objekt sein: {\"nick\": …, \"avatar\": …}")
+
+    # Alle im Plan vergebenen Kanal-keys/-namen (für die Mention-Prüfung)
+    plan_channel_refs: set = set()
+    for cat in plan.get("categories") or []:
+        if isinstance(cat, dict):
+            if cat.get("key"):
+                plan_channel_refs.add(str(cat["key"]))
+            if cat.get("name"):
+                plan_channel_refs.add(str(cat["name"]))
+            for ch in cat.get("channels") or []:
+                if isinstance(ch, dict):
+                    plan_channel_refs.add(str(ch.get("key") or ch.get("name") or ""))
+    for ch in plan.get("channels") or []:
+        if isinstance(ch, dict):
+            plan_channel_refs.add(str(ch.get("key") or ch.get("name") or ""))
+    plan_channel_refs.discard("")
+
     for index, msg in enumerate(plan.get("messages") or []):
         where = f"messages[{index}]"
         if not isinstance(msg, dict):
@@ -997,6 +1204,17 @@ def _validate_plan(guild: discord.Guild, plan: Dict[str, Any]) -> Dict[str, List
             err(f"{where}.channel", "fehlt — nutze einen 'key', '#name' oder eine ID")
         if not any(msg.get(k) for k in ("content", "embeds", "attachments", "poll", "stickers")):
             warn(where, "Nachricht wäre leer (kein content/embeds/attachments).")
+        haystack = str(msg.get("content") or "") + " " + str(msg.get("embeds") or "")
+        for mention in re.findall(r"<#([^<>#\s]{1,100})>", haystack):
+            if mention.isdigit() or mention in plan_channel_refs:
+                continue
+            if guild.get_channel(_as_int(mention)) is not None:
+                continue
+            if any(c.name == mention for c in guild.channels):
+                continue
+            warn(f"{where}",
+                 f"Kanal-Mention <#{mention}> ist weder key noch existierender Kanal — "
+                 "Platzhalter in Mentions sind verboten; Referenz vorher per GET auflösen.")
 
     for index, rule in enumerate(plan.get("automod") or []):
         where = f"automod[{index}]"
@@ -1057,6 +1275,13 @@ def _find_existing_channel(guild: discord.Guild, name: str, kind: type) -> Optio
         if isinstance(channel, kind) and channel.name.lower() == lowered:
             return channel
     return None
+
+
+def _as_int(value: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
 
 
 def _resolve_key(keys: Mapping[str, Any], value: str) -> Optional[Any]:

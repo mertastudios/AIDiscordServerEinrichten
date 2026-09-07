@@ -680,6 +680,9 @@ async def list_webhooks(ctx: Ctx) -> Dict[str, Any]:
     "POST", "/api/v1/channels/{channel_id}/webhooks", scope="manage", tags=("channels", "webhooks"),
     summary="Webhook anlegen",
     body={"name": "str (Pflicht)", "avatar": "URL/Data-URI (optional)", "reason": "str"},
+    description="Basis für Nachrichten-Personen. Danach: Name/Avatar pro Nachricht "
+                "übersteuern mit POST /api/v1/webhooks/{id}/send — oder direkt "
+                '`{"webhook": {"name": "…", "avatar": "…"}} in POST …/messages.',
 )
 async def create_webhook(ctx: Ctx) -> Dict[str, Any]:
     channel = await ctx.channel()
@@ -707,19 +710,8 @@ async def create_webhook(ctx: Ctx) -> Dict[str, Any]:
     return result
 
 
-@route(
-    "DELETE", "/api/v1/webhooks/{webhook_id}", scope="manage", tags=("webhooks",),
-    summary="Webhook löschen",
-    query={"reason": "str"},
-)
-async def delete_webhook(ctx: Ctx) -> Dict[str, Any]:
-    webhook_id = ctx.path_id("webhook_id")
-    hook = await guard(ctx.client.fetch_webhook(webhook_id), action="Webhook laden")
-    if getattr(hook, "guild_id", None) and hook.guild_id != ctx.guild.id:
-        raise ApiError.forbidden("Dieser Webhook gehört zu einem anderen Server.", code="CROSS_GUILD")
-    await guard(hook.delete(reason=ctx.reason(default="Webhook gelöscht (Arena AI)")),
-                action="Webhook löschen")
-    return {"deleted": {"id": sf(webhook_id), "name": hook.name}}
+# Webhook-Verwaltung (List/Get/Patch/Delete/Send) lebt in routes/webhooks.py —
+# hier bleibt nur das Anlegen pro Kanal, weil der Pfad am Kanal hängt.
 
 
 @route(

@@ -46,7 +46,7 @@ dein Bot-Token.
 │    Server    │               │                                       │
 │              │ ◀──────────── │  ┌─────────────┐   ┌───────────────┐  │
 └──────────────┘  ephemeral:   │  │ discord.py  │   │  aiohttp API  │  │
-                  Link+Token   │  │   Client    │◀──│  113 Endpoints│  │
+                  Link+Token   │  │   Client     │◀──│  121 Endpoints│  │
                                │  └──────┬──────┘   └───────▲───────┘  │
                                │         │                  │          │
                                │    gleicher Prozess, gleicher Loop    │
@@ -353,9 +353,28 @@ Jeder abgelehnte Versuch wird im Render-Log protokolliert.
 
 ---
 
+## Arena-Verhalten: Wie die KI deinen Server aufbaut
+
+Der Prompt und die API-Manager schreiben Arena AI seit dem Upgrade nicht nur
+*vor, welche Endpoints es gibt*, sondern **wie ein guter Server-Einrichter
+arbeitet**:
+
+| Prinzip | Bedeutung |
+| ------- | --------- |
+| **Nachrichten-Hygiene** | Erneuert die KI Regeln/Infos/Willkommen, löscht sie **zuerst** die alten Nachrichten im Kanal (`purge`, auch >14 Tage alte via `bulk: false`) und pinnt die neue Version an. Doppelte Regel-Postings sind ein Fehler, kein Feature. |
+| **Webhook-Personen** | Regeln, News & Willkommen werden nie als nüchterne Bot-Nachricht, sondern als Persona gesendet — eigener Name + eigenes Avatar-Bild (`"webhook": {"name": "📜 Serverregeln"}`). Der Webhook wird automatisch angelegt und wiederverwendet. |
+| **Branding komplett** | Server-Icon/Banner (`PATCH /guild`), Webhook-Avatare (`PATCH /webhooks/{id}`) und **das Profilbild des Bots für diesen Server** (`PATCH /members/me` — Nickname, Avatar, Banner, Bio) gehören zum Standard-Setup. |
+| **Unicode-Design** | Kanäle, Kategorien und Rollen bekommen einen einheitlichen Unicode-Stil: `「✦」regeln`, `「📌」 INFORMATION`, `꒰👑꒱ Owner`, `✦・chat`. Der Style-Guide liegt unter `GET /api/v1/guides/design`. |
+| **Rechte immer mitdenken** | Jede Rolle bekommt explizite Permissions, jede Kategorie Overwrites — Info-Kanäle gesperrt für @everyone, Team-Bereiche unsichtbar, Muted-Rolle berücksichtigt. Der Setup-Validator warnt, wenn etwas fehlt. |
+| **Keine Platzhalter** | Die KI erfindet nie `<@123…>`/`<#000…>`-Mentions, sondern löst echte IDs per GET auf. Im Setup-Plan werden `<#key>`-Mentions automatisch zu echten Kanal-Mentions aufgelöst. |
+| **Ehrlich bei Fremd-Bots** | Self Roles/Reaction Roles konfiguriert ein Drittanbieter-Bot — Bots dürfen andere Bots nicht einrichten. Die KI bereitet alles Vorarbeitbare (Rollen, Kanal, Persona-Nachricht mit echten Rollen-Mentions), darf Commands anderer Bots aufrufen und postet dem Nutzer eine fertige Schritt-für-Schritt-Anleitung (`GET /api/v1/guides/self-roles` — mit Textbausteinen für Carl-bot, Dyno, MEE6, YAGPDB …). |
+| **Sicherheit als Standard** | `verification_level: medium`, Inhaltsfilter, AutoMod-Regeln gegen Werbung/Beleidigungen/Mention-Raid — siehe `GET /api/v1/guides/security`. |
+
+---
+
 ## Die REST-API
 
-**113 Endpoints.** Alles unter `/api/v1/*`, Authentifizierung per
+**121 Endpoints.** Alles unter `/api/v1/*`, Authentifizierung per
 `Authorization: Bearer <TOKEN>`.
 
 Die API ist **selbstbeschreibend** — das ist der wichtigste Designentscheid:
@@ -366,9 +385,10 @@ curl -s "https://DEINE-URL/api/v1/capabilities" \
 ```
 
 liefert jeden Endpoint mit Methode, Pfad, Beschreibung, benötigtem Scope,
-Query-Parametern, Body-Feldern und Beispielen — plus Konventionen,
-curl-Templates, Rate-Limits und die Liste der Setup-Vorlagen. Arena AI muss
-deshalb nichts vorher wissen und nichts auswendig lernen.
+Query-Parametern, Body-Feldern und Beispielen — plus Konventionen
+(u. a. Webhook-Personas, Nachrichten-Hygiene, keine Mention-Platzhalter,
+Unicode-Design), curl-Templates, Rate-Limits und die Liste der Setup-Vorlagen.
+Arena AI muss deshalb nichts vorher wissen und nichts auswendig lernen.
 
 ### Konventionen
 
@@ -380,6 +400,9 @@ deshalb nichts vorher wissen und nichts auswendig lernen.
 - Zeitstempel in ISO-8601 UTC
 - Permissions als Namen (`"manage_channels"`), Farben als `"#RRGGBB"`
 - Fast jeder schreibende Endpoint akzeptiert `"reason"` fürs Audit-Log
+- **Webhook zuerst**: System-Nachrichten als Persona (`{"webhook": {"name": …}}`)
+- **Aufräumen vor dem Posten**: alte Regeln/Infos per `purge` löschen, nie doppelt
+- **Keine Platzhalter-Mentions** — echte IDs, im Setup-Plan `<#key>`-Mentions
 
 ### Die wichtigsten Endpoints
 
@@ -391,9 +414,14 @@ deshalb nichts vorher wissen und nichts auswendig lernen.
 | `GET /api/v1/guild/snapshot` | Der gesamte Ist-Zustand in **einem** Aufruf. |
 | `GET /api/v1/me` | Wer bin ich, wo bin ich, was darf ich? |
 | `GET /api/v1/channels/tree` | Kanalstruktur als Baum. |
+| `GET /api/v1/guides` | Fertige Anleitungen: Self Roles, Unicode-Design, Branding, Webhooks, Security. |
 | `POST /api/v1/setup` | **Komplettes Server-Setup in einem Aufruf.** |
 | `POST /api/v1/setup/preview` | Denselben Plan validieren, ohne etwas zu ändern. |
-| `GET /api/v1/setup/templates` | Fünf fertige deutsche Server-Vorlagen. |
+| `GET /api/v1/setup/templates` | Sechs fertige deutsche Server-Vorlagen. |
+| `POST /api/v1/channels/{id}/messages` | Nachricht senden — mit `"webhook"`-Feld als Persona mit eigenem Namen & Avatar. |
+| `POST /api/v1/webhooks/{id}/send` | Direkt als Webhook senden (Name/Avatar pro Nachricht übersteuern). |
+| `GET/PATCH /api/v1/webhooks[/{id}]` | Webhooks listen, umbenennen, Avatar setzen, verschieben. |
+| `PATCH /api/v1/members/me` | **Server-Profil des Bots**: Nickname, Avatar, Banner, Bio — nur für diesen Server. |
 | `GET /api/v1/prompt` | Den Arena-AI-Prompt (`short` / `long` / `system`). |
 
 Dazu: Rollen, Kanäle (Text, Voice, Stage, Forum, Media, Kategorien, Threads,
@@ -406,18 +434,24 @@ Voice-States, Action-Log.
 
 ### `POST /api/v1/setup` — der Kraftmeier
 
-Ein einziger Aufruf, der einen kompletten Server aufbaut:
+Ein einziger Aufruf, der einen kompletten Server aufbaut — inklusive
+Unicode-Design, Webhook-Personen, Bot-Profil und echter Kanal-Mentions:
 
 ```json
 {
-  "template": "gaming-community",
-  "roles":     [{"key": "mod", "name": "🛡️ Mod", "preset": "moderator", "position": 16}],
-  "categories": [{"key": "info", "name": "📌 INFO", "position": 0,
-                  "channels": [{"key": "regeln", "name": "regeln", "type": "text",
-                                "topic": "Bitte lesen",
-                                "overwrites": [{"role_key": "mod", "allow": ["send_messages"]}]}]}],
-  "messages":  [{"channel": "regeln",
-                 "embeds": [{"title": "📜 Regeln", "color": "#5865F2", "description": "…"}]}],
+  "template": "aesthetic-community",
+  "guild":     {"name": "Mein Server", "icon": "https://…/icon.png",
+                "verification_level": "medium"},
+  "roles":     [{"key": "mod", "name": "「🛡️」 Mod", "preset": "moderator", "position": 16}],
+  "categories": [{"key": "info", "name": "「📌」 INFORMATION", "position": 0,
+                  "overwrites": [{"id": "@everyone", "deny": ["send_messages"]}],
+                  "channels": [{"key": "regeln", "name": "「✦」regeln", "type": "text",
+                                "topic": "Bitte lesen"}]}],
+  "bot_profile": {"nick": "✨ Server-Assistent", "avatar": "https://…/avatar.png"},
+  "messages":  [{"channel": "regeln", "pin": true,
+                 "webhook": {"name": "📜 Serverregeln", "avatar": "https://…/regeln.png"},
+                 "embeds": [{"title": "📜 Regeln", "color": "#5865F2",
+                             "description": "Start in <#regeln>!"}]}],
   "settings":  {"system_channel": "welcome", "rules_channel": "regeln",
                 "afk_channel": "AFK", "afk_timeout": 900, "community": true},
   "automod":   [{"name": "Werbung", "trigger_type": "keyword",
@@ -430,21 +464,26 @@ Ein einziger Aufruf, der einen kompletten Server aufbaut:
 
 Der Executor arbeitet in der richtigen Reihenfolge (Rollen **vor** Kanälen,
 damit Overwrites die neuen Rollen schon referenzieren können; Server-Einstellungen
-**nach** Kanälen, damit `afk_channel` existiert), bündelt Rollenpositionen in
-einen einzigen API-Call, übersetzt `key`-Referenzen über eine interne Tabelle und
-meldet am Ende **jeden einzelnen Schritt** mit OK/Fehler:
+**nach** Kanälen, damit `afk_channel` existiert; Bot-Profil **vor** den
+Nachrichten), bündelt Rollenpositionen in einen einzigen API-Call, übersetzt
+`key`-Referenzen über eine interne Tabelle, ersetzt `<#key>`-Mentions durch
+**echte** Kanal-Mentions, sendet Nachrichten mit `webhook`-Feld als Persona
+(anlegen + anpinnen inklusive) und meldet am Ende **jeden einzelnen Schritt**
+mit OK/Fehler:
 
 ```json
 {"ok": true, "steps_total": 41, "steps_ok": 41, "steps_failed": 0,
  "report": […], "keys": {"mod": "1234…", "regeln": "5678…"},
- "created": {"roles": […], "channels": […]}, "next_steps": […]}
+ "created": {"roles": […], "channels": […], "messages": […], "webhooks": […]},
+ "next_steps": […]}
 ```
 
-**Fünf fertige Vorlagen** — alle deutsch, alle validiert, alle direkt ausführbar:
+**Sechs fertige Vorlagen** — alle deutsch, alle validiert, alle direkt ausführbar:
 
 | Vorlage | Inhalt |
 | ------- | ------ |
-| `gaming-community` | Voice-Lounges, LFG, Turnier-Kanäle, Team-Bereich |
+| `aesthetic-community` | Unicode-Design (「✦」, ꒰꒱), Webhook-Personen, Rollen-Wahl-Kanal |
+| `gaming-community` | Voice-Lounges, LFG, Turnier-Kanäle, Team-Bereich — im Klammern-Stil |
 | `creator-streamer` | Stream-Ankündigungen, Subscriber-Bereich, Clip-Forum |
 | `lerngruppe` | Fächerkanäle, Ressourcen-Forum, Lernräume, Tutoren-Rollen |
 | `business-support` | Support-Kategorien, Ticket-Forum, Wissensdatenbank |
@@ -612,7 +651,7 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 203 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 261 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
@@ -630,10 +669,12 @@ Discord-Client ([`scripts/_fake_discord.py`](scripts/_fake_discord.py)) und prü
 | `read` | Guild, Kanalbaum, Rollen, Mitglieder, Suche, Permissions, Snapshot, Audit-Log |
 | `scopes` | `read` darf nicht schreiben, `read_write` darf alles · Legacy-Modi werden gemappt |
 | `errors` | JSON statt HTML bei 404/405, ungültiges JSON, fremder Server |
-| `setup` | Alle fünf Vorlagen validieren; fehlerhafte Pläne werden abgewiesen |
+| `setup` | Alle sechs Vorlagen validieren; fehlerhafte Pläne werden abgewiesen |
 | `lifecycle` | Token erneuern, widerrufen, Ablauf |
 | `ratelimit` | `429` mit `retry_after` und `Retry-After`-Header, Budget pro Token |
-| `write` | **Alle fünf Vorlagen werden wirklich ausgeführt** — Rollen, Kategorien, Kanäle, Nachrichten, Invites, AutoMod |
+| `write` | **Alle sechs Vorlagen werden wirklich ausgeführt** — Rollen, Kategorien, Kanäle, Nachrichten, Invites, AutoMod |
+| `arena` | Webhook-Personen (Anlegen/Wiederverwenden/`/send`), Bot-Profil via `PATCH /members/me`, Guides, echte `<#key>`-Mentions im Setup, Purge vor dem Erneuern, Platzhalter-Warnung |
+| `prompt` | Prompt-Varianten transportieren Hygiene/Personas/Branding/Grenzen; `capabilities.conventions` komplett |
 | `limit` | Sitzungs-Limit pro Server, Auto-Revoke des ältesten Tokens |
 | `security` | Kein Token-Leak in Antworten, Logs oder der Console; CORS; Header |
 
@@ -844,21 +885,24 @@ AIDiscordServerEinrichten/
 │       ├── registry.py      @route-Dekorator + Endpoint-Verzeichnis
 │       ├── channel_ops.py   Kanäle anlegen/bearbeiten/auflösen
 │       ├── message_ops.py   Nachrichten, Embeds, Komponenten
+│       ├── webhook_ops.py   Webhook-Personen + echte Mentions statt Platzhalter
 │       ├── images.py        Icons/Banner aus URL, Base64 oder Emoji
 │       └── routes/
 │           ├── meta.py      health, capabilities, me, session, prompt, snapshot
 │           ├── guild.py     Server-Einstellungen, Welcome, Onboarding, Widget
 │           ├── channels.py  Kanäle, Kategorien, Threads, Positionen
 │           ├── roles.py     Rollen, Positionen, Vorlagen
-│           ├── members.py   Mitglieder, Suche, Permissions
+│           ├── members.py   Mitglieder, Suche, Permissions, Bot-Profil (/members/me)
 │           ├── moderation.py Timeout, Kick, Ban, Prune, AutoMod
-│           ├── messages.py  Senden, Bearbeiten, Purge, Pins, Reaktionen
+│           ├── messages.py  Senden (auch als Persona), Purge, Pins, Reaktionen
+│           ├── webhooks.py  Webhooks listen/bearbeiten/löschen/senden
+│           ├── guides.py    Fertige Anleitungen (Self Roles, Design, Branding …)
 │           ├── expressions.py Emojis und Sticker
 │           ├── invites.py   Invites auflisten, anlegen, aufräumen
 │           ├── events.py    Scheduled Events
-│           └── setup.py     Der Setup-Wizard + fünf Vorlagen
+│           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        203 Prüfungen ohne Discord-Verbindung
+│   ├── smoke_test.py        261 Prüfungen ohne Discord-Verbindung
 │   ├── login_recovery_test.py 139 Prüfungen: 429/1015 + Client-Setup (Fake-Uhr)
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double
 ├── deploy/
