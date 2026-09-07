@@ -26,7 +26,8 @@ __all__ = (
     "FakeAsset", "FakeRole", "FakeCategory", "FakeTextChannel", "FakeVoiceChannel",
     "FakeStageChannel", "FakeForumChannel", "FakeMember", "FakeUser", "FakeGuild",
     "FakeClient", "FakeHTTP", "FakeMessage", "FakeInvite", "FakeAutoModRule",
-    "MutableGuild", "GUILD_ID", "BOT_ID", "OWNER_ID", "USER_ID", "fake_response",
+    "FakeWebhook", "MutableGuild", "GUILD_ID", "BOT_ID", "OWNER_ID", "USER_ID",
+    "fake_response",
 )
 
 GUILD_ID = 111111111111111111
@@ -393,6 +394,13 @@ class FakeMember(discord.Member):
             if key == "nick":
                 self.nick = value
                 self._display_name = value or self._name
+            elif key in ("avatar", "banner", "bio"):
+                # Eigenes Server-Profil (nur für das eigene Mitglied erlaubt) —
+                # wird hier nur protokolliert, damit Tests die Mutation sehen.
+                if guild is not None and hasattr(guild, "mutations"):
+                    guild.mutations.append(
+                        f"member.edit:{key}:{'gesetzt' if value is not None else 'entfernt'}")
+                setattr(self, f"_{key}_payload", value)
             elif key == "roles" and value is not None:
                 self._roles = list(value)
                 self._top_role = (max(self._roles, key=lambda r: r.position)
@@ -456,6 +464,7 @@ class FakeMessage:
         self.stickers: List[Any] = []
         self.flags = discord.MessageFlags._from_value(0)
         self.components: List[Any] = []
+        self.webhook_id: Optional[int] = None
 
     async def edit(self, **kwargs: Any) -> "FakeMessage":
         self.content = kwargs.get("content", self.content)
@@ -501,6 +510,51 @@ class FakeAutoModRule:
         self.enabled = True
         self.exempt_roles: List[Any] = []
         self.exempt_channels: List[Any] = []
+
+
+class FakeWebhook:
+    """Imitiert ``discord.Webhook`` für die Persona-Tests."""
+
+    def __init__(self, wid: int, name: str, channel: Any, guild: Any) -> None:
+        self.id = wid
+        self.name = name
+        self.type = discord.WebhookType.incoming
+        self.channel_id = channel.id
+        self.guild_id = guild.id
+        self.channel = channel
+        self.guild = guild
+        self.user = guild.me
+        self.token = f"fake-token-{wid}"
+        self.avatar = None
+        self.created_at = now()
+        self._persona = name
+
+    @property
+    def url(self) -> str:
+        return f"https://discord.com/api/webhooks/{self.id}/{self.token}"
+
+    async def send(self, content: Optional[str] = None, **kwargs: Any) -> "FakeMessage":
+        persona = kwargs.get("username") or self.name
+        self._persona = persona
+        author = FakeUser(int(self.id), persona, bot=True)
+        embeds = list(kwargs.get("embeds") or [])
+        message = FakeMessage(self.guild._new_id(), self.channel, author,  # noqa: SLF001
+                              content=content or "", embeds=embeds)
+        message.webhook_id = self.id
+        self.guild.sent_messages.append(message)  # noqa: SLF001
+        self.guild._log(f"webhook.send:{persona}")  # noqa: SLF001
+        return message
+
+    async def edit(self, **kwargs: Any) -> "FakeWebhook":
+        for key, value in kwargs.items():
+            if key in ("name", "avatar", "channel") and value is not None:
+                setattr(self, key, value)
+        self.guild._log(f"webhook.edit:{self.name}")  # noqa: SLF001
+        return self
+
+    async def delete(self, **_kwargs: Any) -> None:
+        self.guild._webhooks = [w for w in self.guild._webhooks if w.id != self.id]  # noqa: SLF001
+        self.guild._log(f"webhook.delete:{self.name}")  # noqa: SLF001
 
 
 class FakeGuild:
@@ -597,6 +651,10 @@ class FakeGuild:
         self.verified = False
         self.invites_disabled = False
         self.mutations: List[str] = []
+        self._webhooks: List[Any] = []
+
+    async def webhooks(self) -> List[Any]:
+        return list(self._webhooks)
 
     # ── interne Pflege ───────────────────────────────────────────────────────
     def _reindex(self) -> None:
@@ -706,6 +764,10 @@ class MutableGuild(FakeGuild):
         self.automod_rules: List[FakeAutoModRule] = []
         self.automod = self.automod_rules
         self._next_id = 10 ** 17
+        for channel in self.channels:
+            # Auch die Kanäle aus der Basis-Ausstattung (regeln, Lounge, …)
+            # bekommen die Schreib-/Webhook-/Purge-Attrappen.
+            self._attach_helpers(channel)
 
     def _new_id(self) -> int:
         self._next_id += 1
@@ -755,6 +817,16 @@ class MutableGuild(FakeGuild):
         return kwargs
 
     # ── Kanäle ────────────────────────────────────────────────────────────────
+    def _attach_helpers(self, channel: Any) -> Any:
+        """Setzt die schreibbaren Attrappen (send/webhooks/purge/…) auf einen Kanal."""
+        channel.send = _make_send(self, channel)              # type: ignore[method-assign]
+        channel.create_invite = _make_invite(self, channel)    # type: ignore[method-assign]
+        channel.edit = _make_edit(self, channel)               # type: ignore[method-assign]
+        channel.webhooks = _make_channel_webhooks(self, channel)  # type: ignore[method-assign]
+        channel.create_webhook = _make_create_webhook(self, channel)  # type: ignore[method-assign]
+        channel.purge = _make_purge(self, channel)             # type: ignore[method-assign]
+        return channel
+
     def _attach(self, channel: Any) -> Any:
         channel.guild = self
         self.channels.append(channel)
@@ -762,15 +834,15 @@ class MutableGuild(FakeGuild):
         if category is not None and hasattr(category, "channels"):
             category.channels = list(category.channels or []) + [channel]
         self._reindex()
-        channel.send = _make_send(self, channel)              # type: ignore[method-assign]
-        channel.create_invite = _make_invite(self, channel)    # type: ignore[method-assign]
-        channel.edit = _make_edit(self, channel)               # type: ignore[method-assign]
+        self._attach_helpers(channel)
         return channel
 
     async def create_category(self, name: str, **kwargs: Any) -> FakeCategory:
-        category = FakeCategory(self._new_id(), name,
-                                position=kwargs.get("position") if kwargs.get("position") is not None
-                                else len(self.categories))
+        # discord.py-Codepad: fehlende Felder kommen als MISSING-Sentinel —
+        # für den Test zählt das wie "nicht angegeben".
+        pos = kwargs.get("position")
+        position = pos if isinstance(pos, int) else len(self.categories)
+        category = FakeCategory(self._new_id(), name, position=position)
         self._log(f"create_category:{name}")
         return self._attach(category)
 
@@ -873,6 +945,43 @@ def _make_edit(guild: MutableGuild, channel: Any):
     return edit
 
 
+def _make_channel_webhooks(guild: MutableGuild, channel: Any):
+    async def webhooks() -> List[FakeWebhook]:
+        return [w for w in guild._webhooks if w.channel_id == channel.id]  # noqa: SLF001
+
+    return webhooks
+
+
+def _make_create_webhook(guild: MutableGuild, channel: Any):
+    async def create_webhook(*, name: str, avatar: Any = None,
+                             reason: Optional[str] = None, **_kwargs: Any) -> FakeWebhook:
+        hook = FakeWebhook(guild._new_id(), name, channel, guild)  # noqa: SLF001
+        hook.avatar = avatar
+        guild._webhooks.append(hook)  # noqa: SLF001
+        guild._log(f"create_webhook:{name}")  # noqa: SLF001
+        return hook
+
+    return create_webhook
+
+
+def _make_purge(guild: MutableGuild, channel: Any):
+    async def purge(limit: int = 100, *, check: Any = None, bulk: bool = True,
+                    reason: Optional[str] = None, **_kwargs: Any) -> List[FakeMessage]:
+        victims: List[FakeMessage] = []
+        remaining: List[FakeMessage] = []
+        for message in guild.sent_messages:
+            if message.channel is channel and len(victims) < limit:
+                if check is None or check(message):
+                    victims.append(message)
+                    continue
+            remaining.append(message)
+        guild.sent_messages = remaining  # noqa: SLF001
+        guild._log(f"purge:#{getattr(channel, 'name', channel.id)}:{len(victims)}")  # noqa: SLF001
+        return victims
+
+    return purge
+
+
 class FakeClient:
     """Imitiert ``discord.Client`` so weit, wie die API es braucht."""
 
@@ -900,7 +1009,11 @@ class FakeClient:
                 return channel
         raise not_found("Unknown Channel")
 
-    async def fetch_webhook(self, _wid: int) -> Any:
+    async def fetch_webhook(self, wid: int) -> Any:
+        for guild in self.guilds:
+            for hook in getattr(guild, "_webhooks", []) or []:
+                if hook.id == wid:
+                    return hook
         raise not_found("Unknown Webhook")
 
     @property

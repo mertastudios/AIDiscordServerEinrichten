@@ -465,8 +465,8 @@ def build_app(state: AppState) -> web.Application:
     """Erzeugt die aiohttp-Application und registriert alle Endpoints."""
     from .console import register_console_routes
     from .routes import (  # noqa: F401  — Import registriert die Endpoints
-        channels, events, expressions, guild, invites, members, messages, meta,
-        moderation, roles, setup,
+        channels, events, expressions, guides, guild, invites, members, messages,
+        meta, moderation, roles, setup, webhooks,
     )
 
     app = web.Application(client_max_size=state.config.max_body_bytes)

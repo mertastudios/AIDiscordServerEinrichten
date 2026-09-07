@@ -126,10 +126,14 @@ async def list_pins(ctx: Ctx) -> Dict[str, Any]:
 
 
 @route(
-    "POST", "/api/v1/channels/{channel_id}/messages", scope="write", tags=("messages",),
-    summary="Nachricht senden (Text, Embeds, Buttons, Dateien, Umfrage)",
+    "POST", "/api/v1/channels/{channel_id}/messages", scope="write", tags=("messages", "webhooks"),
+    summary="Nachricht senden (Text, Embeds, Buttons, Dateien, Umfrage — oder als Webhook-Persona)",
     body={
         "content": "str (max. 2000 Zeichen)",
+        "webhook": '{ "name": "📜 Serverregeln", "avatar": "https://…/bild.png" } | true | "Name" '
+                   "— sendet als Webhook-Persona mit eigenem Namen & Profilbild",
+        "webhook_name": "str — Kurzform für webhook.name",
+        "webhook_avatar": "URL — Kurzform für webhook.avatar",
         "embeds": '[{"title","description","color","url","footer":{"text","icon_url"},'
                   '"thumbnail":"url","image":"url","author":{"name","url","icon_url"},'
                   '"fields":[{"name","value","inline"}],"timestamp":"ISO"}]',
@@ -141,17 +145,24 @@ async def list_pins(ctx: Ctx) -> Dict[str, Any]:
         "reply_to": "Nachrichten-ID",
         "mention_reply": "bool",
         "tts": "bool", "silent": "bool", "suppress_embeds": "bool",
+        "pin": "bool — Nachricht nach dem Senden anpinnen (perfekt für Regeln/Infos)",
         "delete_after": "Sekunden — Selbstlöschung",
     },
     examples=[
         {"body": {"content": "**Willkommen!** Schön, dass du da bist 👋"}},
-        {"body": {"embeds": [{"title": "Serverregeln", "color": "#5865F2",
+        {"body": {"webhook": {"name": "📜 Serverregeln",
+                              "avatar": "https://cdn.discordapp.com/embed/avatars/0.png"},
+                  "embeds": [{"title": "Regeln", "color": "#5865F2",
                               "fields": [{"name": "1. Respekt", "value": "Keine Beleidigungen."}],
-                              "footer": {"text": "Team"}}]}},
+                              "footer": {"text": "Team"}}],
+                  "pin": True}},
         {"body": {"content": "Mehr Infos:",
                   "components": [[{"label": "Website", "style": "link", "url": "https://example.com"}]]}},
     ],
-    description="Antwort enthält die fertige Nachricht inklusive ID und jump_url.",
+    description="Mit ``webhook``-Feld erscheint die Nachricht als eigene Persona "
+                "(Name + Avatar) statt als Bot — für Regeln, News & Willkommen "
+                "immer vorziehen. Der Webhook wird bei Bedarf automatisch angelegt. "
+                "Antwort enthält die fertige Nachricht inklusive ID und jump_url.",
 )
 async def send_message(ctx: Ctx) -> Dict[str, Any]:
     channel = await ctx.channel()
@@ -162,12 +173,35 @@ async def send_message(ctx: Ctx) -> Dict[str, Any]:
             code="CHANNEL_TYPE_MISMATCH",
         )
     data = await ctx.body()
+
+    from ..webhook_ops import normalize_webhook_spec, send_as_webhook
+
+    webhook_spec = normalize_webhook_spec(data)
     kwargs, notes = await build_message_kwargs(data, ctx=ctx, channel=channel)
 
-    message = await guard(channel.send(**kwargs), action=f"Nachricht in '{getattr(channel, 'name', channel.id)}' senden")
+    if webhook_spec is not None:
+        message, webhook_notes = await send_as_webhook(
+            channel, webhook_spec, kwargs,
+            reason=ctx.reason(data, default=None),
+        )
+        notes = notes + webhook_notes
+        via = "webhook"
+    else:
+        message = await guard(channel.send(**kwargs),
+                              action=f"Nachricht in '{getattr(channel, 'name', channel.id)}' senden")
+        via = "bot"
+
+    pinned = False
+    if parse_bool(data.get("pin"), field="pin", default=False) and hasattr(message, "pin"):
+        await guard(message.pin(), action="Nachricht anpinnen")
+        pinned = True
+        notes.append("Nachricht angepinnt.")
+
     await ctx.settle(0.3)
     result: Dict[str, Any] = {"sent": serialize_message(message), "id": sf(message.id),
-                              "jump_url": message.jump_url}
+                              "jump_url": message.jump_url, "via": via}
+    if pinned:
+        result["pinned"] = True
     if notes:
         result["notes"] = notes
     return result
@@ -303,13 +337,19 @@ async def bulk_delete_messages(ctx: Ctx) -> Dict[str, Any]:
         "author_id": "nur Nachrichten dieses Nutzers",
         "contains": "nur Nachrichten mit diesem Text",
         "bots_only": "bool — nur Bot-Nachrichten",
+        "webhooks_only": "bool — nur Webhook-Nachrichten (z. B. alte Regeln)",
         "before": "Nachrichten-ID",
         "after": "Nachrichten-ID",
+        "bulk": "bool, Standard true — schnell, aber nur Nachrichten < 14 Tage. "
+                "false = einzeln löschen, erfasst auch ältere (langsamer, aber vollständig)",
         "confirm": "true — Pflicht",
         "reason": "str",
     },
-    description="Nur Nachrichten jünger als 14 Tage können im Bulk gelöscht "
-                "werden; ältere löscht Discord einzeln (langsamer).",
+    description="Das Standardwerkzeug beim Erneuern von Regel-/Info-/Willkommens-"
+                "Kanälen: erst Purge (bots_only/webhooks_only), dann die neue "
+                "Nachricht posten. Alte Versionen dürfen nie doppelt herumstehen. "
+                "Nachrichten älter als 14 Tage werden im Bulk-Modus still "
+                "übersprungen — für die brauche es bulk: false.",
 )
 async def purge_messages(ctx: Ctx) -> Dict[str, Any]:
     channel = await ctx.channel()
@@ -328,9 +368,12 @@ async def purge_messages(ctx: Ctx) -> Dict[str, Any]:
     author_id = data.get("author_id") and as_id(data["author_id"], field="author_id")
     contains = (data.get("contains") or "").lower()
     bots_only = bool(parse_bool(data.get("bots_only"), field="bots_only", default=False))
+    webhooks_only = bool(parse_bool(data.get("webhooks_only"), field="webhooks_only", default=False))
 
     def check(message: discord.Message) -> bool:
         if author_id and message.author.id != author_id:
+            return False
+        if webhooks_only and getattr(message, "webhook_id", None) is None:
             return False
         if bots_only and not message.author.bot:
             return False
@@ -338,7 +381,8 @@ async def purge_messages(ctx: Ctx) -> Dict[str, Any]:
             return False
         return True
 
-    kwargs: Dict[str, Any] = {"limit": limit, "check": check, "bulk": True,
+    bulk = bool(parse_bool(data.get("bulk"), field="bulk", default=True))
+    kwargs: Dict[str, Any] = {"limit": limit, "check": check, "bulk": bulk,
                               "reason": ctx.reason(data, default="Purge (Arena AI)")}
     for key in ("before", "after"):
         if data.get(key):
@@ -350,6 +394,7 @@ async def purge_messages(ctx: Ctx) -> Dict[str, Any]:
         "deleted_count": len(removed),
         "deleted": [{"id": sf(m.id), "author": m.author.name} for m in removed[:50]],
         "channel_id": sf(channel.id),
+        "mode": "bulk" if bulk else "einzeln (erfasst auch Nachrichten > 14 Tage)",
     }
 
 

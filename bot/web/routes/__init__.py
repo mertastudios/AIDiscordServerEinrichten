@@ -6,6 +6,7 @@ from . import (  # noqa: F401  (Import erzeugt die Registrierung)
     channels,
     events,
     expressions,
+    guides,
     guild,
     invites,
     members,
@@ -14,6 +15,7 @@ from . import (  # noqa: F401  (Import erzeugt die Registrierung)
     moderation,
     roles,
     setup,
+    webhooks,
 )
 
 __all__ = [
@@ -24,8 +26,10 @@ __all__ = [
     "members",
     "moderation",
     "messages",
+    "webhooks",
     "invites",
     "expressions",
     "events",
+    "guides",
     "setup",
 ]
