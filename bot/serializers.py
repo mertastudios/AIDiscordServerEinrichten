@@ -101,6 +101,30 @@ def _asset(value: Any) -> Optional[str]:
         return None
 
 
+def _mask_webhook_url(url: Any) -> Optional[str]:
+    """
+    Discord-Webhook-URL ohne geheimen Token zurückgeben.
+
+    ``Webhook.url`` enthält bei Webhooks der eigenen App den dauerhaften
+    Webhook-Token. Der gehört nicht in Listen-/Detailantworten: Wer ihn hat,
+    kann dauerhaft in den Kanal posten — auch nachdem ein Relay-Session-Token
+    abgelaufen ist. Beim *Erstellen* eines Webhooks wird der Token weiterhin
+    bewusst einmalig separat zurückgegeben.
+    """
+    if not url:
+        return None
+    text = str(url)
+    marker = "/api/webhooks/"
+    if marker not in text:
+        return text
+    prefix, rest = text.split(marker, 1)
+    parts = rest.split("/", 2)
+    if len(parts) >= 2:
+        suffix = f"/{parts[2]}" if len(parts) == 3 else ""
+        return f"{prefix}{marker}{parts[0]}/***{suffix}"
+    return text
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Nutzer / Mitglieder / Rollen
 # ─────────────────────────────────────────────────────────────────────────────
@@ -715,7 +739,12 @@ def serialize_emoji(emoji: Optional[discord.Emoji]) -> Optional[Dict[str, Any]]:
         "name": emoji.name,
         "animated": emoji.animated,
         "managed": emoji.managed,
-        "requires_colons": emoji.requires_colons,
+        # discord.py nennt das Feld seit 2.x ``require_colons`` (ohne s).
+        # Ältere/andere Modelle können ``requires_colons`` liefern. Der
+        # Serializer darf an Versionsdetails nie den gesamten Snapshot killen.
+        "requires_colons": getattr(
+            emoji, "requires_colons", getattr(emoji, "require_colons", None)
+        ),
         "available": emoji.available,
         "url": emoji.url,
         "roles": [{"id": sf(r.id), "name": r.name} for r in getattr(emoji, "roles", [])],
@@ -750,7 +779,10 @@ def serialize_webhook(webhook: Optional[discord.Webhook]) -> Optional[Dict[str, 
         "channel_id": sf(webhook.channel_id) if webhook.channel_id else None,
         "guild_id": sf(webhook.guild_id) if getattr(webhook, "guild_id", None) else None,
         "avatar_url": _asset(getattr(webhook, "avatar", None)),
-        "url": webhook.url,
+        # Wichtig: webhook.url enthält den geheimen Webhook-Token. In Listen-
+        # und Detailantworten nur maskiert anzeigen; der Token wird nur beim
+        # Erstellen eines Webhooks einmalig separat zurückgegeben.
+        "url": _mask_webhook_url(getattr(webhook, "url", None)),
         "token": None,  # bewusst NICHT exponiert
         "creator": serialize_user(getattr(webhook, "user", None)),
         "created_at": iso(getattr(webhook, "created_at", None)),
@@ -765,26 +797,58 @@ def serialize_ban(entry: Any) -> Dict[str, Any]:
     }
 
 
+def _serialize_audit_changes(changes: Any) -> List[Dict[str, Any]]:
+    """Audit-Log-Änderungen kompatibel zu verschiedenen discord.py-Versionen."""
+    if changes is None:
+        return []
+
+    # discord.py 2.x: entry.changes ist ein AuditLogChanges-Objekt mit
+    # ``before``/``after`` (AuditLogDiff). Das Objekt selbst ist NICHT mehr
+    # iterierbar — genau daran scheiterte /api/v1/guild/audit-logs.
+    before_diff = getattr(changes, "before", None)
+    after_diff = getattr(changes, "after", None)
+    if before_diff is not None or after_diff is not None:
+        before = dict(before_diff or {}) if before_diff is not None else {}
+        after = dict(after_diff or {}) if after_diff is not None else {}
+        keys = sorted(set(before) | set(after))
+        return [
+            {
+                "attribute": key,
+                "before": jsonable(before.get(key)),
+                "after": jsonable(after.get(key)),
+            }
+            for key in keys
+        ]
+
+    # Ältere/alternative Modelle lieferten eine Liste von Change-Objekten.
+    try:
+        iterator = iter(changes)
+    except TypeError:
+        return []
+    return [
+        {
+            "attribute": getattr(change, "attr", None) or getattr(change, "attribute", None),
+            "before": jsonable(getattr(change, "before", None)),
+            "after": jsonable(getattr(change, "after", None)),
+        }
+        for change in iterator
+    ]
+
+
 def serialize_audit_entry(entry: discord.AuditLogEntry) -> Dict[str, Any]:
+    target = getattr(entry, "target", None)
     return {
         "id": sf(entry.id),
         "action": _name(entry.action),
         "action_value": _enum(entry.action),
         "user": serialize_user(getattr(entry, "user", None)),
         "target_id": sf(entry.target_id) if getattr(entry, "target_id", None) else None,
-        "target": jsonable(getattr(entry, "target", None)) if not hasattr(entry.target, "id")
-                  else {"id": sf(entry.target.id), "name": getattr(entry.target, "name", None)},
+        "target": jsonable(target) if not hasattr(target, "id")
+                  else {"id": sf(target.id), "name": getattr(target, "name", None)},
         "reason": entry.reason,
         "created_at": iso(entry.created_at),
         "category": _name(getattr(entry, "category", None)),
-        "changes": [
-            {
-                "attribute": getattr(change, "attr", None) or getattr(change, "attribute", None),
-                "before": jsonable(getattr(change, "before", None)),
-                "after": jsonable(getattr(change, "after", None)),
-            }
-            for change in getattr(entry, "changes", [])
-        ],
+        "changes": _serialize_audit_changes(getattr(entry, "changes", None)),
         "extra": jsonable(getattr(entry, "extra", None)),
     }
 

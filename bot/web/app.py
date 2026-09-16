@@ -474,7 +474,17 @@ def build_app(state: AppState) -> web.Application:
     app.middlewares.append(infrastructure_middleware)
 
     for endpoint in sorted_endpoints():
-        app.router.add_route(endpoint.method, endpoint.path, make_handler(endpoint, state))
+        handler = make_handler(endpoint, state)
+        if endpoint.method == "GET":
+            # UptimeRobot und manche Load-Balancer prüfen HTTP-URLs standardmäßig
+            # per HEAD. ``add_route('GET', ...)`` registriert in aiohttp KEIN
+            # automatisches HEAD; Ergebnis war 405 Method Not Allowed und Render
+            # wurde trotz „5-Minuten-Ping" nicht zuverlässig wach gehalten.
+            # ``add_get(..., allow_head=True)`` macht alle GET-Endpunkte HEAD-
+            # kompatibel; aiohttp unterdrückt dabei den Body automatisch.
+            app.router.add_get(endpoint.path, handler, allow_head=True)
+        else:
+            app.router.add_route(endpoint.method, endpoint.path, handler)
 
     register_console_routes(app, state)
 
