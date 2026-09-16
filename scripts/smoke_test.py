@@ -170,6 +170,9 @@ async def t_public(h: Harness) -> None:
     print("── Öffentliche Endpoints ─────────────────────────────────────")
     health = await h.anon.call("GET", "/api/health")
     check("GET /api/health → 200", health["status"] == 200, str(health["json"])[:200])
+    head_health = await h.anon.call("HEAD", "/api/health")
+    check("HEAD /api/health → 200 (UptimeRobot-kompatibel)",
+          head_health["status"] == 200, str(head_health["status"]))
     check("health.ok == true", health["json"].get("ok") is True)
     data = health["json"].get("data", {})
     check("health.status == 'healthy'", data.get("status") == "healthy", str(data)[:200])
@@ -862,6 +865,41 @@ async def t_security(h: Harness) -> None:
           str(len(session.token_hash)))
     check("Sessions sind pro Server getrennt",
           {s.guild_id for s in store.active_for_guild(GUILD_ID)} <= {GUILD_ID})
+
+    from bot.serializers import _mask_webhook_url, _serialize_audit_changes, serialize_emoji
+
+    class _Emoji:
+        id = 1
+        name = "test"
+        animated = False
+        managed = False
+        require_colons = True
+        available = True
+        url = "https://cdn.example/emoji.png"
+        roles: List[Any] = []
+        created_at = _now()
+
+    check("Emoji-Serializer unterstützt discord.py require_colons",
+          serialize_emoji(_Emoji()).get("requires_colons") is True)
+    check("Webhook-URLs werden ohne geheimen Token serialisiert",
+          _mask_webhook_url("https://discord.com/api/webhooks/123/secret")
+          == "https://discord.com/api/webhooks/123/***")
+
+    class _Diff:
+        def __init__(self, **items: Any) -> None:
+            self.__dict__.update(items)
+
+        def __iter__(self):
+            return iter(self.__dict__.items())
+
+    class _Changes:
+        before = _Diff(name="alt")
+        after = _Diff(name="neu", color=123)
+
+    serialized_changes = _serialize_audit_changes(_Changes())
+    check("AuditLogChanges aus discord.py 2.x sind serialisierbar",
+          {c["attribute"] for c in serialized_changes} == {"name", "color"},
+          str(serialized_changes))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

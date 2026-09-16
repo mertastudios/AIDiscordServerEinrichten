@@ -230,7 +230,7 @@ def resolve_mention_placeholders(
     """
     Ersetzt ``<#key-oder-name>`` / ``<@&key-oder-name>`` durch echte Mentions.
 
-    ``<#regeln>`` wird im Setup-Kontext zu ``<#123456789012345678``\ ``>``, weil
+    ``<#regeln>`` wird im Setup-Kontext z. B. zu ``<#123456789012345678>``, weil
     ``regeln`` ein Kanal-Key des Plans ist. Nicht auflösbare Referenzen bleiben
     unverändert — die API rät nie eine ID, sondern liefert sie zurück, damit der
     Absender (KI) den Fehler sieht.

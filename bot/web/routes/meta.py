@@ -203,6 +203,13 @@ async def diagnostics(ctx: Ctx) -> Dict[str, Any]:
             "Steht er auf 'connection_refused': Intents im Developer Portal "
             "prüfen (SERVER MEMBERS INTENT / MESSAGE CONTENT INTENT).",
         ]
+    elif verdict == VERDICT_OK:
+        steps = [
+            "Alles grün: discord.com ist erreichbar und der Discord-Login steht auf online.",
+            "Wenn Discord den Bot trotzdem offline anzeigt, kurz /api/health neu laden "
+            "und den Render-Log um den Offline-Zeitpunkt prüfen — dann ist es kein "
+            "Cloudflare-/IP-Bann, sondern ein Gateway-/Presence-Effekt.",
+        ]
     elif verdict == "not_checked":
         steps = ["Diagnose läuft noch — in ein paar Sekunden mit ?refresh=1 erneut abrufen."]
     else:
