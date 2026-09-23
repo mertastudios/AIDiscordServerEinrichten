@@ -148,8 +148,9 @@ Nach dem Deploy steht im Render-Log:
 
 ### 4. Loslegen
 
-Auf Discord `/connect` ausführen → Prompt kopieren → bei Arena AI einfügen →
-sagen, was die KI bauen soll. Fertig.
+Auf Discord `/connect` ausführen → auf **Verbinden** klicken → den kleinen
+Prompt (URL + Token) kopieren → bei Arena AI einfügen und sagen, was die KI
+bauen soll. Fertig.
 
 ---
 
@@ -289,27 +290,61 @@ Diagnose) — kein offenes Relay. Alternative ohne VPS: QuotaGuard Static
 
 ## Der `/connect`-Command
 
-Der eine Command, um den es geht.
-
-```
-/connect [dauer] [modus]
-```
-
-| Option  | Werte | Standard |
-| ------- | ----- | -------- |
-| `dauer` | 1 h · 6 h · **24 h** · 3 T · 7 T · 30 T · unbegrenzt | 24 Stunden |
-| `modus` | ✍️ Lesen + Schreiben · 👁️ Nur lesen | Lesen + Schreiben |
+Der eine Command, um den es geht — **ohne Optionen**. Dauer und Modus gibt es
+nicht mehr zum Auswählen: Es gelten die Defaults aus der Konfiguration
+(24 h Gültigkeit, Modus *Lesen + Schreiben*; `SESSION_TTL_HOURS` und Co. bleiben
+anpassbar). Ein Klick weniger, eine Stolperfalle weniger.
 
 **Was du bekommst — und wer es sieht:**
 
-Die Antwort ist **ephemeral**. Nur du siehst sie; für alle anderen im Channel ist
-sie unsichtbar, und sie taucht in keinem Log auf.
+Die Antwort ist **ephemeral** und eine moderne **Container-V2-Nachricht**
+(Discord *Components V2*): ein Container mit Akzentfarbe, Textblöcken,
+Trennlinien und Buttons. Nur du siehst sie; für alle anderen im Channel ist sie
+unsichtbar.
 
-- **Eine Nachricht** — kurz erklärt, dann der fertige Prompt im Codeblock.
-  **URL und Token stecken schon im Prompt** — den Block einmal kopieren (Discord
-  hat dafür einen Kopier-Button), bei Arena AI einfügen, fertig.
-- **Drei Buttons** — `🖥️ Console öffnen` · `🔄 Neues Token` · `⛔ Alle widerrufen`
-  (persistent: funktionieren auch nach einem Render-Deploy noch)
+**Zustand 1 — Bridge noch deaktiviert:**
+
+> # Willkommen!
+> Du kannst sofort mit Arena AI losarbeiten. Die Bridge für diesen Server ist
+> aktuell noch deaktiviert. Um zu beginnen, klicke auf diesen Button:
+> ─────────────
+> **[🔌 Verbinden]** *(grün)*
+
+Der Klick erzeugt das Sitzungs-Token **erst in diesem Moment** und bearbeitet
+dieselbe Nachricht in Zustand 2.
+
+**Zustand 2 — verbunden** (auch das bekommst du zu sehen, wenn du `/connect`
+aufrufst, während bereits eine Verbindung besteht):
+
+> # Willkommen!
+> Du kannst sofort mit Arena AI losarbeiten.
+> ─────────────
+> **1. Kopiere diesen Prompt:**
+> ```
+> Discord-Bridge für Arena AI
+> URL: https://dein-relay.onrender.com
+> TOKEN: adse_…
+> Start: GET …/api/v1/capabilities mit Header "Authorization: Bearer TOKEN"
+> ```
+> ─────────────
+> **2. Öffne Arena AI, schreib ihm was er auf deinem Server einrichten soll
+> und schick ihm den Prompt:**
+> **[🤖 Arena AI öffnen]**
+> ─────────────
+> **Weitere Optionen:**
+> **[⛔ Verbindung trennen]** *(rot)* **[🔄 Neues Token generieren]**
+
+Der Prompt ist bewusst **minimal** — nur URL und Token: Alles Weitere (Regeln,
+Workflow, Konventionen, Vorlagen) erzählt die Bridge Arena AI **während der
+Arbeit** selbst über `GET /api/v1/capabilities` und die `/guides`-Endpoints.
+Die Buttons sind persistent (funktionieren auch nach einem Render-Deploy noch):
+
+| Button | Wirkung |
+| ------ | ------- |
+| 🔌 **Verbinden** | Erzeugt das Token, bearbeitet die Nachricht in den verbundenen Zustand. |
+| 🤖 **Arena AI öffnen** | Link-Button direkt zum Arena-Agenten. |
+| ⛔ **Verbindung trennen** | Widerruft **alle** Tokens dieses Servers sofort; die Nachricht springt zurück in Zustand 1. |
+| 🔄 **Neues Token generieren** | Macht die alten Tokens sofort ungültig und zeigt den Prompt mit dem frischen Token. |
 
 **Zwei Command-Brüder für den Notfall:**
 
@@ -318,7 +353,7 @@ sie unsichtbar, und sie taucht in keinem Log auf.
 | `/status` | Rechte-Check: Ist der Bot Administrator? Was fehlt? Wie viele Tokens sind aktiv? |
 | `/revoke` | Entzieht **sofort** allen aktiven KI-Zugriffen auf diesem Server die Gültigkeit |
 
-**Beide Prüfungen, beide Richtungen.** `/connect` verweigert sich, wenn
+**Beide Prüfungen, beide Richtungen.** `/connect` (und jeder Button) verweigert sich, wenn
 
 - **du** kein Administrator bist → `⛔ Administrator-Rechte erforderlich`
 - **der Bot** kein Administrator ist → Anleitung, wie du die Rolle hochstufst,
@@ -336,6 +371,7 @@ Jeder abgelehnte Versuch wird im Render-Log protokolliert.
 | **Token werden nie im Klartext gespeichert** | Nur SHA-256-Hashes. Selbst ein Diebstahl von `data/sessions.json` liefert keine nutzbaren Tokens. |
 | **Token sind server-gebunden** | Ein Token für Server A funktioniert auf Server B nicht (`409 GUILD_UNAVAILABLE`). |
 | **Token laufen ab** | Standard 24 h, konfigurierbar. `ttl_hours=0` für unbegrenzt ist bewusst möglich, aber nicht empfohlen. |
+| **Inaktivitäts-Stopp** | War ein Token 24 h verfügbar, wurde aber 24 h lang nicht benutzt, stoppt die Bridge die Verbindung automatisch (`SESSION_INACTIVITY_HOURS`, `0` = aus). Arena AI bekommt beim nächsten Aufruf einen 401er mit Anleitung zum schnellen Wiederanbinden. |
 | **Sofortiger Widerruf** | `/revoke`, der `⛔`-Button, die Console oder `DELETE /api/v1/session`. |
 | **Sitzungs-Limit** | Maximal 5 aktive Tokens pro Server; das älteste wird automatisch widerrufen. |
 | **Berechtigungs-Stufen** | `read` · `write` · `manage` · `danger` — jeder Endpoint hat einen Minimal-Scope. |
@@ -582,6 +618,7 @@ Eine kommentierte Vorlage liegt in [`.env.example`](.env.example).
 | `ACTIVITY_TEXT` | `/connect · KI-Steuerung …` | Presence-Text des Bots. |
 | `PRESENCE_STATUS` | `online` | `online` / `idle` / `dnd` / `invisible`. |
 | `SESSION_TTL_HOURS` | `24` | Standard-Gültigkeit eines Tokens. `0` = unbegrenzt. |
+| `SESSION_INACTIVITY_HOURS` | `24` | Verbindung wird automatisch gestoppt, wenn das Token so lange ungenutzt bleibt. `0` = aus. |
 | `MAX_SESSIONS_PER_GUILD` | `5` | Aktive Tokens pro Server, bevor das älteste widerrufen wird. |
 | `PERSIST_SESSIONS` | `true` | Tokens in `DATA_DIR/sessions.json` sichern. |
 | `DATA_DIR` | `data` | Datenverzeichnis (auf Render Free flüchtig). |
@@ -651,11 +688,11 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 261 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 274 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
-python scripts/login_recovery_test.py # 139 Prüfungen: Login/Rate-Limit + Client-Setup
+python scripts/login_recovery_test.py # 146 Prüfungen: Login/Rate-Limit + Client-Setup
 python -m bot.netcheck                # echte Netz-Diagnose (IP + discord.com)
 ```
 
@@ -739,8 +776,13 @@ Cold-Start) oder wurde vom Server entfernt. 5–10 Sekunden warten, erneut
 versuchen; sonst `/connect` neu ausführen.
 
 **`401 TOKEN_MISSING` / `TOKEN_INVALID` / `TOKEN_REVOKED`**
-Token fehlt, ist abgelaufen oder wurde widerrufen. `/connect` erneut ausführen.
-Jede dieser Antworten enthält einen `hint` mit genau dieser Anleitung.
+Token fehlt, ist abgelaufen, wurde widerrufen oder die Verbindung wurde nach
+24 Stunden ohne Nutzung automatisch gestoppt. Die Meldungen richten sich an
+Arena AI: Sie sagen der KI, was der Server-Admin **vermutlich getan** hat
+(neues Token generiert, Verbindung getrennt/zurückgesetzt, Inaktivität) und wie
+die Verbindung schnell wieder aufgebaut wird — `/connect`, **Verbinden**
+klicken, neuen Prompt schicken. Der Admin selbst führt einfach `/connect` erneut
+aus.
 
 **Bot bleibt offline: `429 Too Many Requests` / Cloudflare `Error 1015`**
 
@@ -869,7 +911,7 @@ AIDiscordServerEinrichten/
 ├── bot/
 │   ├── main.py              Einstiegspunkt: Bot + Web-Server in einem Loop
 │   ├── __main__.py          python -m bot
-│   ├── discord_bot.py       /connect, /status, /revoke, Buttons, Rechteprüfungen
+│   ├── discord_bot.py       /connect, /status, /revoke, Container-V2-Buttons, Rechteprüfungen
 │   ├── config.py            Umgebungsvariablen, Validierung, maskierte Ausgabe
 │   ├── netcheck.py          Netz-Diagnose: ausgehende IP + discord.com-Probe
 │   ├── restarts.py          Neustart-Buch: Zyklen + gesehene IPs über Prozessgrenzen
@@ -902,8 +944,8 @@ AIDiscordServerEinrichten/
 │           ├── events.py    Scheduled Events
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        261 Prüfungen ohne Discord-Verbindung
-│   ├── login_recovery_test.py 139 Prüfungen: 429/1015 + Client-Setup (Fake-Uhr)
+│   ├── smoke_test.py        274 Prüfungen ohne Discord-Verbindung
+│   ├── login_recovery_test.py 146 Prüfungen: 429/1015 + Client-Setup (Fake-Uhr)
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double
 ├── deploy/
 │   ├── docker-compose.yml   VPS: Bot + Caddy (HTTPS) aus dem vorhandenen Dockerfile

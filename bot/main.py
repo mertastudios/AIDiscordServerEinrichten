@@ -117,6 +117,8 @@ async def _housekeeping(state: AppState, stop: asyncio.Event) -> None:
     Hintergrundaufgabe:
 
     * entfernt abgelaufene/widerrufene Sitzungen und schreibt sie weg,
+    * stoppt Verbindungen automatisch, deren Token zu lange ungenutzt war
+      (Standard: 24 Stunden — „verfügbar, aber niemand benutzt es“),
     * protokolliert alle 5 Minuten einen Herzschlag (praktisch im Render-Log),
     * hält den Prozess beschäftigt, falls der Gateway kurz hängt.
     """
@@ -128,6 +130,18 @@ async def _housekeeping(state: AppState, stop: asyncio.Event) -> None:
             pass
         try:
             state.store._prune_locked()  # noqa: SLF001 — bewusst, gleiche Klasse
+            idle_hours = float(getattr(state.config, "session_inactivity_hours", 0.0) or 0.0)
+            stopped = await state.store.revoke_inactive(
+                timedelta(hours=idle_hours) if idle_hours > 0 else None
+            )
+            if stopped:
+                log.warning(
+                    "⛔ %d Verbindung(en) automatisch gestoppt: Token länger als %.0f Stunde(n) "
+                    "ungenutzt. Arena AI bekommt bei weiteren Versuchen einen 401er mit "
+                    "Anleitung zum schnellen Wiederanbinden.",
+                    len(stopped), idle_hours,
+                )
+                state.maybe_save(force=True)
             state.maybe_save(min_interval=60.0)
         except Exception as exc:  # noqa: BLE001
             log.warning("Housekeeping-Fehler: %s", exc)

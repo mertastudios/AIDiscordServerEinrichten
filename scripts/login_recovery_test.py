@@ -57,7 +57,10 @@ import discord  # noqa: E402
 
 from bot import main as botmain  # noqa: E402
 from bot.config import Config, ConfigError, load_config, mask_proxy_url  # noqa: E402
-from bot.discord_bot import RelayClient  # noqa: E402
+from bot.discord_bot import (  # noqa: E402
+    CID_CONNECT, CID_DISCONNECT, CID_REGENERATE, RelayClient,
+    connected_view, welcome_view,
+)
 from bot.netcheck import (  # noqa: E402
     DISCORD_PROBE_URL,
     VERDICT_IP_BLOCKED,
@@ -951,7 +954,55 @@ async def test_client_setup() -> None:
           len(client.persistent_views) == 1, str(len(client.persistent_views)))
     check("Command-Sync wurde aufgerufen", len(sync_calls) == 1)
 
-    # 2) Button-Klicks: Die Buttons aus RelayButtons haben keinen Callback —
+    # 1b) /connect ist optionenlos und antwortet als Container-V2-Nachricht.
+    connect_cmd = client.tree.get_command("connect")
+    check("connect hat keine Command-Optionen mehr",
+          connect_cmd is not None and not connect_cmd._params,
+          str(getattr(connect_cmd, "_params", None)))
+
+    def _flatten(view: Any) -> List[Dict[str, Any]]:
+        flat: List[Dict[str, Any]] = []
+
+        def walk(items: List[Dict[str, Any]]) -> None:
+            for item in items:
+                flat.append(item)
+                walk(item.get("components", []))
+
+        walk(view.to_components())
+        return flat
+
+    def _texts(view: Any) -> str:
+        return "\n".join(p.get("content", "") for p in _flatten(view) if p.get("type") == 10)
+
+    def _buttons(view: Any) -> List[Dict[str, Any]]:
+        return [b for p in _flatten(view) if p.get("type") == 2 for b in [p]]
+
+    welcome = welcome_view()
+    check("Willkommen ist Components V2 (Container)",
+          welcome.has_components_v2() and welcome.to_components()[0]["type"] == 17)
+    check("Willkommen: Titel + 'deaktiviert' + Verbinden-Button",
+          "# Willkommen!" in _texts(welcome) and "deaktiviert" in _texts(welcome)
+          and any(b.get("custom_id") == CID_CONNECT and b.get("style") == 3
+                  for b in _buttons(welcome)))
+
+    linked = connected_view("https://relay.example.com", "adse_UNITTEST")
+    check("Verbunden ist Components V2 (Container)",
+          linked.has_components_v2() and linked.to_components()[0]["type"] == 17)
+    linked_text = _texts(linked)
+    check("Verbunden: Prompt-Block enthält nur Verbindung + Start-Zeile",
+          "URL: https://relay.example.com" in linked_text
+          and "TOKEN: adse_UNITTEST" in linked_text
+          and "/api/v1/capabilities" in linked_text
+          and "REGELN:" not in linked_text, linked_text[:200])
+    check("Verbunden: Arena-Link + roter Trennen + Neues Token",
+          any(b.get("url") == "https://arena.ai" for b in _buttons(linked))
+          and any(b.get("custom_id") == CID_DISCONNECT and b.get("style") == 4
+                  for b in _buttons(linked))
+          and any(b.get("custom_id") == CID_REGENERATE for b in _buttons(linked)))
+    check("Verbunden: unter Discords 4000-Zeichen-Limit",
+          linked.content_length() < 4000, str(linked.content_length()))
+
+    # 2) Button-Klicks: Die registrierten Buttons haben keinen Callback —
     #    sie kommen ausschließlich über das globale on_interaction an.
     hits: List[str] = []
 

@@ -239,8 +239,9 @@ class Ctx:
                 f"Diese Aktion benötigt die Berechtigungsstufe '{scope}', "
                 f"das Token läuft aber im Modus '{self.session.mode}' "
                 f"({MODES.get(self.session.mode, {}).get('label', self.session.mode)}).",
-                hint="Bitte /connect erneut ausführen und als Modus "
-                "'Lesen + Schreiben' wählen.",
+                hint="Bitte die Verbindung neu aufbauen: Auf dem Server /connect "
+                "ausführen und auf „Verbinden“ klicken — neue Verbindungen haben "
+                "immer den Modus 'Lesen + Schreiben'.",
                 code="SCOPE_INSUFFICIENT",
             )
 

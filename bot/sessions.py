@@ -7,18 +7,27 @@ Der Bot-Token ist der Generalschlüssel: Wer ihn hat, steuert den Bot auf
 *allen* Servern, kann den Status ändern und (bei Leak) muss er sofort
 zurückgesetzt werden. Die KI bekommt ihn deshalb niemals.
 
-Stattdessen erzeugt ``/connect`` ein **Sitzungs-Token**, das
+Stattdessen erzeugt der **Verbinden**-Button aus ``/connect`` ein
+**Sitzungs-Token**, das
 
 * nur für genau einen Server gilt (``guild_id``),
 * einen Ablaufzeitpunkt hat (TTL),
 * genau zwei Modi kennt: **Lesen + Schreiben** oder **Nur lesen**,
-* jederzeit per Button, ``/revoke`` oder API widerrufbar ist und
+* jederzeit per Button, ``/revoke`` oder API widerrufbar ist,
+* automatisch gestoppt wird, wenn es **24 Stunden lang nicht benutzt** wurde
+  (:meth:`SessionStore.revoke_inactive` — ein verfügbares, aber ungenutztes
+  Token ist ein unnötig offenes Tor), und
 * nur als SHA-256-Hash gespeichert wird (Speicher-Dump ≠ Token-Leak).
 
 Die Tokens leben im Prozess-Speicher und werden zusätzlich nach
 ``DATA_DIR/sessions.json`` geschrieben, damit ein Neustart (z. B. durch einen
 Render-Deploy) laufende Sitzungen nicht killt. Auf Render **Free** ist die
 Platte flüchtig — dann einfach ``/connect`` erneut ausführen.
+
+Damit Arena AI bei einem ungültigen Token **präzise** Bescheid weiß (neues
+Token generiert? getrennt? Inaktivitäts-Stopp? Neustart?), merkt sich der Store
+gestoppte Verbindungen für begrenzte Zeit im Speicher — nur die Metadaten,
+niemals der Klartext.
 """
 
 from __future__ import annotations
@@ -95,6 +104,13 @@ def normalize_mode(mode: Optional[str]) -> str:
 
 TOKEN_PREFIX = "adse_"
 
+#: Wie lange (und wie viele) gestoppte Verbindungen im Speicher bleiben —
+#: nur für **präzise 401er** („warum ist mein Token weg?“), nicht persistent
+#: und ohne Klartext-Token: Nach einem Neustart fällt die Fehlermeldung auf
+#: die generische Erklärung zurück.
+_REVOKED_CACHE_TTL = timedelta(hours=48)
+_REVOKED_CACHE_MAX = 256
+
 
 def new_token() -> str:
     """Erzeugt ein neues, eindeutig erkennbares Sitzungs-Token."""
@@ -109,6 +125,39 @@ def _short(token: str) -> str:
     """Anzeige-Prefix, z. B. ``adse_9Kd2…`` — niemals das komplette Token."""
     body = token[len(TOKEN_PREFIX):] if token.startswith(TOKEN_PREFIX) else token
     return f"{TOKEN_PREFIX}{body[:6]}…"
+
+
+#: Die „so bist du in einer Minute wieder verbunden“-Anleitung, die in jedem
+#: Token-401er an Arena AI geht. Die KI soll sie dem Server-Admin weitergeben.
+_RECONNECT_STEPS = (
+    "**Schnell wieder verbinden:** Der Admin führt auf dem Discord-Server /connect aus, "
+    "klickt auf **Verbinden** und schickt dir den neuen Prompt (URL + Token) — dann "
+    "weiterarbeiten wie gehabt. Bis dahin kann der Server nicht bearbeitet werden; sag "
+    "das dem Admin bitte, statt es weiter zu versuchen."
+)
+
+
+def _reconnect_hint(cause: str) -> str:
+    """Baut den Hint für einen 401er: Ursache + schnelle Wiederanbindung."""
+    return cause + "\n\n" + _RECONNECT_STEPS
+
+
+def _stopped_reason_text(session: Session) -> str:
+    """Menschliche Erklärung, **warum** eine Verbindung gestoppt wurde."""
+    by = (session.revoked_by or "").lower()
+    if by.startswith("auto:inactivity"):
+        return ("die Verbindung wurde automatisch gestoppt, weil das Token länger als "
+                "24 Stunden nicht benutzt wurde")
+    if by.startswith("auto:limit"):
+        return ("die Verbindung wurde automatisch widerrufen, weil das Limit gleichzeitiger "
+                "Tokens pro Server erreicht war")
+    if by.startswith("api:regenerate"):
+        return "es wurde ein neues Token generiert (Button oder API) — damit ist das alte ungültig"
+    if by.startswith("api:"):
+        return "die Verbindung wurde über die API beendet"
+    if by.startswith("discord:") or by.startswith("button:"):
+        return "der Server-Admin hat die Verbindung getrennt"
+    return "die Verbindung wurde beendet"
 
 
 @dataclass
@@ -183,6 +232,7 @@ class Session:
             "active": self.is_active,
             "revoked": self.is_revoked,
             "revoked_at": iso(self.revoked_at),
+            "revoked_by": self.revoked_by,
         }
 
     def to_storage(self) -> Dict[str, Any]:
@@ -274,6 +324,10 @@ class SessionStore:
         self._lock = asyncio.Lock()
         self._actions: Deque[ActionRecord] = deque(maxlen=action_log_size)
         self._dirty = False
+        # Hash → kürzlich gestoppte Session (nur Metadaten). Dient allein dazu,
+        # Arena AI bei einem 401 zu sagen, WARUM das Token weg ist — siehe
+        # ``_remember_revoked`` und ``_unknown_token_error``.
+        self._revoked_cache: Dict[str, Session] = {}
         if self.persist:
             self.load()
 
@@ -389,6 +443,7 @@ class SessionStore:
             oldest = min(active, key=lambda s: s.created_at)
             oldest.revoked_at = now_utc()
             oldest.revoked_by = "auto:limit"
+            self._remember_revoked(oldest)
             log.info("Sitzung %s automatisch widerrufen (Limit %d pro Server).", oldest.id, self.max_per_guild)
             active.remove(oldest)
 
@@ -408,34 +463,40 @@ class SessionStore:
 
         Wirft :class:`ApiError` mit präziser Ursache — das ist absichtlich
         *kein* ``None``, damit die API konsistente 401er mit Erklärung liefert.
+        Die Meldungen richten sich an **Arena AI** (den Aufrufer): Sie sagen
+        der KI, was der Server-Admin vermutlich getan hat und wie die
+        Verbindung schnell wieder aufgebaut wird.
         """
         if not token or not isinstance(token, str):
             raise ApiError.unauthorized(
                 "Token fehlt.",
-                hint='Sende den Header: Authorization: Bearer <TOKEN>',
+                hint='Sende den Header: Authorization: Bearer <TOKEN> — der Server-Admin '
+                     "bekommt es auf Discord über /connect (Button „Verbinden“).",
                 code="TOKEN_MISSING",
             )
         token = token.strip()
-        session = self._by_hash.get(hash_token(token))
+        token_hash = hash_token(token)
+        session = self._by_hash.get(token_hash)
         if session is None:
-            hint = (
-                "Das Token ist unbekannt. Mögliche Ursachen: (1) Server wurde neu gestartet und "
-                "nutzt flüchtigen Speicher → /connect erneut ausführen; (2) Token wurde widerrufen; "
-                "(3) Tippfehler beim Kopieren."
-                if not token.startswith(TOKEN_PREFIX)
-                else "Dieses Token ist unbekannt oder wurde widerrufen. Führe /connect erneut aus."
-            )
-            raise ApiError.unauthorized("Ungültiges oder unbekanntes Token.", hint=hint, code="TOKEN_INVALID")
+            raise self._unknown_token_error(token_hash)
         if session.is_revoked:
+            reason = _stopped_reason_text(session)
             raise ApiError.unauthorized(
-                f"Dieses Token wurde widerrufen ({session.revoked_by or 'unbekannt'}).",
-                hint="Führe /connect erneut aus, um ein neues Token zu erhalten.",
+                f"Dieses Token ist nicht mehr gültig: {reason}.",
+                hint=_reconnect_hint(f"Sag dem Server-Admin, was passiert ist: {reason}."),
                 code="TOKEN_REVOKED",
+                details={
+                    "revoked_by": session.revoked_by,
+                    "revoked_at": iso(session.revoked_at),
+                },
             )
         if session.is_expired:
             raise ApiError.unauthorized(
                 "Dieses Token ist abgelaufen.",
-                hint="Führe /connect erneut aus, um ein neues Token zu erhalten.",
+                hint=_reconnect_hint(
+                    "Sag dem Server-Admin: Die Gültigkeit des Tokens ist abgelaufen "
+                    "(Standard: 24 Stunden)."
+                ),
                 code="TOKEN_EXPIRED",
                 details={"expired_at": iso(session.expires_at)},
             )
@@ -445,6 +506,110 @@ class SessionStore:
         if remote:
             session.last_used_from = remote
         return session
+
+    def _unknown_token_error(self, token_hash: str) -> ApiError:
+        """
+        Der 401er für ein Token, das der Store nicht (mehr) kennt.
+
+        Ist die Verbindung kürzlich **bekannt** gewesen, steht im
+        ``_revoked_cache`` noch, warum sie gestoppt wurde — dann gibt es eine
+        präzise Meldung (z. B. Inaktivitäts-Stopp). Sonst listet die Meldung
+        die wahrscheinlichen Ursachen: neues Token generiert, Verbindung
+        getrennt/zurückgesetzt, 24 Stunden Inaktivität oder ein Neustart mit
+        flüchtigem Speicher.
+        """
+        dead = self._revoked_cache.get(token_hash)
+        if dead is not None and dead.revoked_at is not None:
+            reason = _stopped_reason_text(dead)
+            return ApiError.unauthorized(
+                f"Dieses Token ist nicht mehr gültig: {reason}.",
+                hint=_reconnect_hint(f"Sag dem Server-Admin, was passiert ist: {reason}."),
+                code="TOKEN_REVOKED",
+                details={
+                    "stopped_by": dead.revoked_by,
+                    "revoked_at": iso(dead.revoked_at),
+                    "session_id": dead.id,
+                },
+            )
+        return ApiError.unauthorized(
+            "Ungültiges oder unbekanntes Token.",
+            hint=(
+                "Du (Arena AI) arbeitest mit einem Token, das die Bridge nicht (mehr) kennt. "
+                "Sag dem Server-Admin, was er vermutlich getan hat — und wie er die Verbindung "
+                "schnell wieder aufbaut. Wahrscheinliche Ursachen:\n"
+                "• Er hat ein **neues Token generiert** — damit wurde das alte sofort ungültig.\n"
+                "• Er hat die **Verbindung getrennt oder das Token zurückgesetzt** "
+                "(„Verbindung trennen“, /revoke oder die API).\n"
+                "• Es wurde **zu lange nichts gemacht**: Wird ein Token 24 Stunden lang nicht "
+                "benutzt, stoppt die Bridge die Verbindung automatisch.\n"
+                "• Oder der Bot wurde neu gestartet und verliert dabei Tokens auf flüchtigem "
+                "Speicher (Render Free).\n\n"
+                + _RECONNECT_STEPS
+            ),
+            code="TOKEN_INVALID",
+        )
+
+    def _remember_revoked(self, session: Session) -> None:
+        """
+        Merkt sich eine gestoppte Verbindung (Hash → Metadaten) für bessere 401er.
+
+        Bewusst klein und vergänglich: höchstens ``_REVOKED_CACHE_MAX`` Einträge,
+        nach ``_REVOKED_CACHE_TTL`` fallen sie weg. Nach einem Neustart ist der
+        Cache leer — dann gilt die generische Erklärung.
+        """
+        self._revoked_cache[session.token_hash] = session
+        cutoff = now_utc() - _REVOKED_CACHE_TTL
+        expired = [
+            key for key, value in self._revoked_cache.items()
+            if (value.revoked_at or value.created_at) < cutoff
+        ]
+        for key in expired:
+            del self._revoked_cache[key]
+        if len(self._revoked_cache) > _REVOKED_CACHE_MAX:
+            ordered = sorted(
+                self._revoked_cache.items(),
+                key=lambda item: item[1].revoked_at or item[1].created_at,
+            )
+            for key, _value in ordered[: len(self._revoked_cache) - _REVOKED_CACHE_MAX]:
+                self._revoked_cache.pop(key, None)
+
+    async def revoke_inactive(self, max_idle: Optional[timedelta]) -> List[Session]:
+        """
+        Stoppt Verbindungen, die zu lange ungenutzt waren — automatisch.
+
+        „Zu lange“ = ``max_idle`` seit der letzten Nutzung; wurde ein Token nie
+        benutzt, zählt die Erstellung. Der reguläre Ablauf (TTL) trennt eine
+        Verbindung ohnehin — hier geht es um den Fall „Token vorhanden, aber
+        24 Stunden lang macht niemand etwas damit“.
+
+        Aufgerufen vom Housekeeping-Loop (``bot.main``) alle ~15 Sekunden;
+        ``max_idle <= 0`` oder ``None`` deaktiviert den Stopp.
+        """
+        if max_idle is None or max_idle.total_seconds() <= 0:
+            return []
+        now = now_utc()
+        stopped: List[Session] = []
+        async with self._lock:
+            for session in self._by_hash.values():
+                if not session.is_active:
+                    continue
+                reference = session.last_used_at or session.created_at
+                if now - reference < max_idle:
+                    continue
+                session.revoked_at = now
+                session.revoked_by = "auto:inactivity"
+                self._remember_revoked(session)
+                stopped.append(session)
+            if stopped:
+                self._dirty = True
+                self.save()
+        for session in stopped:
+            log.info(
+                "Sitzung %s (Guild %s, Token %s) automatisch gestoppt: %.1f Stunden ohne Nutzung.",
+                session.id, session.guild_id, session.token_prefix,
+                (now - (session.last_used_at or session.created_at)).total_seconds() / 3600.0,
+            )
+        return stopped
 
     def touch(self, session: Session) -> None:
         session.request_count += 1
@@ -476,6 +641,7 @@ class SessionStore:
                 if session.revoked_at is None:
                     session.revoked_at = stamp
                     session.revoked_by = by
+                    self._remember_revoked(session)
                     revoked.append(session)
             if revoked:
                 self._dirty = True

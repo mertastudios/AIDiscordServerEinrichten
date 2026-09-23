@@ -1,15 +1,34 @@
 """
 Der Discord-Teil: Slash-Commands, Buttons und Rechteprüfungen.
 
-``/connect`` ist *der* Command. Er
+``/connect`` ist *der* Command — bewusst **ohne Optionen**. Dauer und Modus
+waren Stolperfallen; jetzt gelten die Defaults aus der Konfiguration
+(24 h Gültigkeit, Modus „Lesen + Schreiben“ — alles per Umgebungsvariablen
+änderbar).
 
-1. prüft, dass **der Nutzer Administrator** ist,
-2. prüft, dass **der Bot Administrator** ist,
-3. erzeugt ein Sitzungs-Token (nur für diesen Server, mit Ablaufdatum),
-4. antwortet **ephemeral** mit genau einer klaren Nachricht: dem fertigen
-   Prompt für Arena AI im Codeblock — URL und Token stecken darin und werden
-   mit **einem Klick** mitkopiert (Discord-Kopierbutton am Codeblock),
-5. bietet Buttons für Console, Token-Erneuerung und Widerruf.
+Die Antwort ist eine **ephemerale Container-V2-Nachricht** (Discord
+*Components V2*) mit genau einem Container, der zwei Zustände hat:
+
+**Noch nicht verbunden** — die Bridge ist für diesen Server deaktiviert:
+
+* ``# Willkommen!`` + kurzer Einstiegstext
+* ein grüner **Verbinden**-Button: erzeugt das Sitzungs-Token und bearbeitet
+  dieselbe Nachricht in den verbundenen Zustand
+
+**Verbunden**:
+
+* ``# Willkommen!`` — „Du kannst sofort mit Arena AI losarbeiten.“
+* **1. Kopiere diesen Prompt** — ein Mini-Prompt im Codeblock: nur URL und
+  Token. Alles Weitere (Regeln, Workflow, Endpoints) erfährt Arena AI *während
+  der Arbeit* von der Bridge selbst (``GET /api/v1/capabilities`` samt
+  Konventionen und den ``/guides``-Endpoints).
+* **2. Öffne Arena AI …** — inklusive Link-Button direkt zum Arena-Agenten
+* **Weitere Optionen** — **Verbindung trennen** (rot: widerruft *alle* Tokens
+  dieses Servers) und **Neues Token generieren** (macht das alte sofort
+  ungültig und zeigt den aktualisierten Prompt)
+
+Die Buttons sind persistent (``timeout=None`` + Registrierung in
+``setup_hook``): Auch nach einem Render-Deploy reagieren alte Nachrichten noch.
 
 Dazu kommen zwei Sicherheits-Commands: ``/status`` (Rechte-Check) und
 ``/revoke`` (Zugriff sofort entziehen).
@@ -26,8 +45,7 @@ from discord import app_commands
 
 from . import __version__
 from .config import Config, mask_proxy_url
-from .prompt import PromptContext, short_prompt
-from .sessions import DEFAULT_MODE, MODES, SessionStore, normalize_mode
+from .sessions import DEFAULT_MODE, SessionStore
 from .util import ApiError, human_duration, now_utc
 
 log = logging.getLogger("relay.discord")
@@ -43,20 +61,24 @@ OK_COLOR = discord.Color.from_str("#2ECC71")
 WARN_COLOR = discord.Color.from_str("#F1C40F")
 ERR_COLOR = discord.Color.from_str("#E74C3C")
 
-DURATION_CHOICES = [
-    app_commands.Choice(name="⏱️ 1 Stunde", value=1.0),
-    app_commands.Choice(name="🕕 6 Stunden", value=6.0),
-    app_commands.Choice(name="📅 24 Stunden (empfohlen)", value=24.0),
-    app_commands.Choice(name="🗓️ 3 Tage", value=72.0),
-    app_commands.Choice(name="🗓️ 7 Tage", value=168.0),
-    app_commands.Choice(name="🗓️ 30 Tage", value=720.0),
-    app_commands.Choice(name="♾️ Unbegrenzt (nicht empfohlen)", value=0.0),
-]
+#: Ziel des „Arena AI öffnen“-Link-Buttons.
+ARENA_URL = "https://arena.ai"
 
-MODE_CHOICES = [
-    app_commands.Choice(name="✍️ Lesen + Schreiben — alles einrichten & moderieren (Standard)", value="read_write"),
-    app_commands.Choice(name="👁️ Nur lesen — nichts verändern", value="read"),
-]
+#: Akzentfarbe der Container: Blurple fürs Willkommen, Grün für verbunden.
+WELCOME_ACCENT = discord.Color.from_str("#5865F2")
+CONNECTED_ACCENT = discord.Color.from_str("#2ECC71")
+
+# Custom-IDs der persistenten Buttons — sie überleben einen Neustart.
+CID_CONNECT = "relay:v2_connect"
+CID_DISCONNECT = "relay:v2_disconnect"
+CID_REGENERATE = "relay:v2_regenerate"
+
+# Legacy-IDs der Buttons vor dem Components-V2-Upgrade. Nachrichten aus der
+# Zeit vor dem Deploy sollen nicht ins Leere laufen: Ihre Klicks werden auf
+# die neuen Handler gemappt (die bearbeiten die alte Nachricht dann in die
+# neue Optik).
+CID_LEGACY_REGENERATE = "relay:regenerate"
+CID_LEGACY_REVOKE_ALL = "relay:revoke_all"
 
 
 def build_intents(privileged: bool = True) -> discord.Intents:
@@ -79,45 +101,119 @@ def build_intents(privileged: bool = True) -> discord.Intents:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Buttons (persistent, überleben einen Neustart)
+#  Container-V2-Nachrichten (Components V2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class RelayButtons(discord.ui.View):
+def _bridge_prompt_block(base_url: str, token: str) -> str:
     """
-    Die drei Buttons unter der ``/connect``-Antwort.
+    Der Mini-Prompt für Arena AI: **nur** Verbindung und Einstieg.
 
-    ``timeout=None`` + Registrierung in ``setup_hook`` macht sie persistent:
-    Auch nach einem Render-Deploy reagieren alte Nachrichten noch.
+    Der komplette Regel- und Workflow-Katalog (Hygiene, Personas, Branding,
+    Unicode-Design …) muss der Nutzer nicht mehr kopieren — die Bridge erklärt
+    sich Arena AI selbst, sobald diese arbeitet: ``GET /api/v1/capabilities``
+    liefert Konventionen und Endpoints, dazu die ``/api/v1/guides/*``-Texte.
     """
+    return (
+        "Discord-Bridge für Arena AI\n"
+        f"URL: {base_url}\n"
+        f"TOKEN: {token}\n"
+        f'Start: GET {base_url}/api/v1/capabilities mit Header "Authorization: Bearer TOKEN"'
+    )
 
-    def __init__(self, client: "RelayClient", console_url: str) -> None:
-        super().__init__(timeout=None)
-        self.client = client
-        self.add_item(
+
+def welcome_view() -> discord.ui.LayoutView:
+    """Container-V2-Nachricht für „Bridge noch deaktiviert“."""
+    container = discord.ui.Container(
+        discord.ui.TextDisplay(
+            "# Willkommen!\n"
+            "Du kannst sofort mit Arena AI losarbeiten. Die Bridge für diesen "
+            "Server ist aktuell noch deaktiviert. Um zu beginnen, klicke auf "
+            "diesen Button:"
+        ),
+        discord.ui.Separator(),
+        discord.ui.ActionRow(
             discord.ui.Button(
-                label="Console öffnen",
-                emoji="🖥️",
+                label="Verbinden",
+                emoji="🔌",
+                style=discord.ButtonStyle.success,
+                custom_id=CID_CONNECT,
+            )
+        ),
+        accent_colour=WELCOME_ACCENT,
+    )
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
+def connected_view(base_url: str, token: str) -> discord.ui.LayoutView:
+    """Container-V2-Nachricht für „Bridge aktiv“: Prompt, Arena-Link, Optionen."""
+    container = discord.ui.Container(
+        discord.ui.TextDisplay(
+            "# Willkommen!\n"
+            "Du kannst sofort mit Arena AI losarbeiten."
+        ),
+        discord.ui.Separator(),
+        discord.ui.TextDisplay(
+            "**1. Kopiere diesen Prompt:**\n"
+            f"```\n{_bridge_prompt_block(base_url, token)}\n```"
+        ),
+        discord.ui.Separator(),
+        discord.ui.TextDisplay(
+            "**2. Öffne Arena AI, schreib ihm was er auf deinem Server "
+            "einrichten soll und schick ihm den Prompt:**"
+        ),
+        discord.ui.ActionRow(
+            discord.ui.Button(
+                label="Arena AI öffnen",
+                emoji="🤖",
                 style=discord.ButtonStyle.link,
-                url=console_url,
+                url=ARENA_URL,
             )
-        )
-        self.add_item(
+        ),
+        discord.ui.Separator(),
+        discord.ui.TextDisplay("**Weitere Optionen:**"),
+        discord.ui.ActionRow(
             discord.ui.Button(
-                label="Neues Token",
-                emoji="🔄",
-                style=discord.ButtonStyle.primary,
-                custom_id="relay:regenerate",
-            )
-        )
-        self.add_item(
-            discord.ui.Button(
-                label="Alle widerrufen",
+                label="Verbindung trennen",
                 emoji="⛔",
                 style=discord.ButtonStyle.danger,
-                custom_id="relay:revoke_all",
+                custom_id=CID_DISCONNECT,
+            ),
+            discord.ui.Button(
+                label="Neues Token generieren",
+                emoji="🔄",
+                style=discord.ButtonStyle.secondary,
+                custom_id=CID_REGENERATE,
+            ),
+        ),
+        accent_colour=CONNECTED_ACCENT,
+    )
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
+def _button_registration_view() -> discord.ui.LayoutView:
+    """
+    Wird nie angezeigt: Diese View registriert in ``setup_hook`` nur die drei
+    Custom-ID-Buttons bei discord.py, damit Klicks auf alte Nachrichten auch
+    nach einem Neustart ihren Handler finden. Die eigentliche Arbeit passiert
+    in :meth:`RelayClient.on_interaction` — die Buttons hier haben absichtlich
+    keinen Callback.
+    """
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(
+        discord.ui.Container(
+            discord.ui.ActionRow(
+                discord.ui.Button(label="Verbinden", custom_id=CID_CONNECT),
+                discord.ui.Button(label="Verbindung trennen", custom_id=CID_DISCONNECT),
+                discord.ui.Button(label="Neues Token generieren", custom_id=CID_REGENERATE),
             )
         )
+    )
+    return view
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,9 +262,10 @@ class RelayClient(discord.Client):
     # ── Lifecycle ────────────────────────────────────────────────────────────
     async def setup_hook(self) -> None:
         self._register_commands()
-        # Persistente Button-View registrieren (URL-Button ist dekorativ,
-        # die Custom-ID-Buttons brauchen den Handler).
-        self.add_view(RelayButtons(self, f"{self.state.base_url()}/console"))
+        # Persistente Button-View registrieren: ``timeout=None`` plus diese
+        # Registrierung sorgt dafür, dass Klicks auf ausgelieferte Nachrichten
+        # auch nach einem Render-Deploy noch dispatched werden.
+        self.add_view(_button_registration_view())
         await self._sync_commands()
 
     async def _sync_commands(self) -> None:
@@ -289,43 +386,71 @@ class RelayClient(discord.Client):
             )
         return None
 
+    async def _new_session(self, guild: discord.Guild, member: discord.Member, *, note: str):
+        """
+        Legt eine Sitzung mit den Defaults aus der Konfiguration an
+        (Gültigkeit = ``SESSION_TTL_HOURS``, Modus = Lesen + Schreiben) und
+        gibt ``(session, plaintext_token)`` zurück.
+        """
+        return await self.store.create(
+            guild_id=guild.id,
+            guild_name=guild.name,
+            created_by=member.id,
+            created_by_name=member.display_name,
+            mode=DEFAULT_MODE,
+            ttl_hours=self.config.session_ttl_hours,
+            note=note,
+        )
+
     # ── Command-Registrierung ────────────────────────────────────────────────
     def _register_commands(self) -> None:
         command_name = self.config.command_name
 
         @self.tree.command(
             name=command_name,
-            description="🔗 Link + Token für Arena AI erzeugen (nur für dich sichtbar)",
+            description="🔗 Mit Arena AI verbinden (nur für dich sichtbar)",
         )
         @app_commands.guild_only()
-        @app_commands.describe(
-            dauer="Wie lange soll der Zugriff gültig sein?",
-            modus="Was darf die KI auf diesem Server tun?",
-        )
-        @app_commands.choices(dauer=DURATION_CHOICES, modus=MODE_CHOICES)
-        async def connect(
-            interaction: discord.Interaction,
-            dauer: float = 24.0,
-            modus: str = DEFAULT_MODE,
-        ) -> None:
-            """Der Haupt-Command: erzeugt Link + Token und den fertigen KI-Prompt."""
+        async def connect(interaction: discord.Interaction) -> None:
+            """Der Haupt-Command: zeigt die Willkommens-Nachricht bzw. den verbundenen Zustand."""
             gate = await self._guard(interaction)
             if gate is None:
                 return
             guild = gate["guild"]
             member = gate["member"]
 
-            session, token = await self.store.create(
-                guild_id=guild.id,
-                guild_name=guild.name,
-                created_by=member.id,
-                created_by_name=member.display_name,
-                mode=modus,
-                ttl_hours=dauer,
-                note="per /connect erzeugt",
-            )
-            self.state.maybe_save(force=True)
-            await self._send_credentials(interaction, session, token, guild, member)
+            if self.store.active_for_guild(guild.id):
+                # Bereits verbunden → verbundenen Zustand zeigen. Der Klartext
+                # des alten Tokens liegt nicht mehr vor (gespeichert ist nur
+                # sein Hash) — deshalb gibt es ein frisches Token; die alten
+                # bleiben bis zu ihrem Ablauf gültig.
+                session, token = await self._new_session(
+                    guild, member, note="per /connect (bereits verbunden) erneuert"
+                )
+                self.state.maybe_save(force=True)
+                try:
+                    await interaction.response.send_message(
+                        view=connected_view(self.state.base_url(), token), ephemeral=True,
+                    )
+                except discord.HTTPException as exc:
+                    log.error("Antwort auf /%s fehlgeschlagen: %s", self.config.command_name, exc)
+                    return
+                log.info(
+                    "/%s (bereits verbunden) von %s (%s) auf '%s' — frisches Token %s für Sitzung %s",
+                    self.config.command_name, member.display_name, member.id, guild.name,
+                    session.token_prefix, session.id,
+                )
+            else:
+                # Noch nicht verbunden → Willkommen mit grünem Verbinden-Button.
+                try:
+                    await interaction.response.send_message(view=welcome_view(), ephemeral=True)
+                except discord.HTTPException as exc:
+                    log.error("Antwort auf /%s fehlgeschlagen: %s", self.config.command_name, exc)
+                    return
+                log.info(
+                    "/%s (Willkommen, Bridge deaktiviert) von %s (%s) auf '%s'.",
+                    self.config.command_name, member.display_name, member.id, guild.name,
+                )
 
         @self.tree.command(
             name="status",
@@ -453,7 +578,7 @@ class RelayClient(discord.Client):
         self, interaction: discord.Interaction, *, require_bot_admin: bool = True
     ) -> Optional[Dict[str, Any]]:
         """
-        Zentrale Prüfung vor jedem Command.
+        Zentrale Prüfung vor jedem Command und Button-Klick.
 
         Liefert ``None``, wenn bereits eine Fehlerantwort gesendet wurde,
         sonst ``{"guild": …, "member": …}``.
@@ -517,132 +642,96 @@ class RelayClient(discord.Client):
         except discord.HTTPException as exc:
             log.error("Fehlerantwort konnte nicht gesendet werden: %s", exc)
 
-    # ── Antwort mit Zugangsdaten ─────────────────────────────────────────────
-    async def _send_credentials(
-        self,
-        interaction: discord.Interaction,
-        session,
-        token: str,
-        guild: discord.Guild,
-        member: discord.Member,
-    ) -> None:
-        base = self.state.base_url()
-        console_url = f"{base}/console?t={token}"
-        prompt_ctx = PromptContext(
-            base_url=base,
-            token=token,
-            guild_name=guild.name,
-            guild_id=guild.id,
-            mode_label=MODES.get(session.mode, {}).get("label", session.mode),
-            scope=session.scope,
-            expires_label=session.to_public_dict()["expires_in"],
-            session_id=session.id,
-            member_count=guild.member_count,
-            console_url=console_url,
-        )
-        short = short_prompt(prompt_ctx)
-
-        # ── Antwort: EINE Nachricht — nur der Prompt, fertig zum Kopieren ────
-        mode_info = MODES.get(session.mode, {})
-        expires = session.to_public_dict()["expires_in"]
-        intro = (
-            "✅ **Fertig!** Kopiere den **kompletten Block** unten (Kopier-Button "
-            "oben rechts am Codeblock) und schicke ihn bei **Arena AI** als "
-            "Nachricht ein — **URL + Token** für die Verbindung stecken schon "
-            "im Prompt.\n"
-            f"{mode_info.get('emoji', '')} Modus: **{mode_info.get('label', session.mode)}** · "
-            f"⏳ gültig: **{expires}**\n\n"
-        )
-        view = RelayButtons(self, console_url)
-        try:
-            await interaction.response.send_message(
-                content=_prompt_message(intro, short), view=view, ephemeral=True,
-            )
-        except discord.HTTPException as exc:
-            log.error("Antwort auf /%s fehlgeschlagen: %s", self.config.command_name, exc)
-            return
-
-        log.info(
-            "/%s ausgeführt von %s (%s) auf '%s' — Sitzung %s, Modus %s, gültig %s",
-            self.config.command_name, member.display_name, member.id, guild.name,
-            session.id, session.mode, session.to_public_dict()["expires_in"],
-        )
-
     # ── Button-Handler ───────────────────────────────────────────────────────
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         """
         Wird von discord.py für JEDE Interaktion gerufen; Slash-Commands
         gehen über den CommandTree, hier zählen nur Komponenten-Klicks.
+
+        Neue Components-V2-Buttons und die Legacy-IDs vor dem Upgrade werden
+        beide bedient — alte Nachrichten laufen so nicht ins Leere.
         """
         if interaction.type is not discord.InteractionType.component:
             return
         custom_id = (interaction.data or {}).get("custom_id", "")
 
-        if custom_id == "relay:regenerate":
-            await self._handle_regenerate(interaction)
-        elif custom_id == "relay:revoke_all":
+        if custom_id == CID_CONNECT:
+            await self._handle_connect(interaction)
+        elif custom_id in (CID_DISCONNECT, CID_LEGACY_REVOKE_ALL):
             await self._handle_revoke_all(interaction)
+        elif custom_id in (CID_REGENERATE, CID_LEGACY_REGENERATE):
+            await self._handle_regenerate(interaction)
 
-    async def _handle_regenerate(self, interaction: discord.Interaction) -> None:
-        guild = interaction.guild
-        member = interaction.user
+    async def _handle_connect(self, interaction: discord.Interaction) -> None:
+        """Grüner „Verbinden“-Button: erzeugt das Token und bearbeitet die Nachricht."""
         gate = await self._guard(interaction)
         if gate is None:
             return
-        await interaction.response.defer(ephemeral=True)
         guild = gate["guild"]
         member = gate["member"]
-        old = self.store.active_for_guild(guild.id)
-        session, token = await self.store.create(
-            guild_id=guild.id,
-            guild_name=guild.name,
-            created_by=member.id,
-            created_by_name=member.display_name,
-            mode=normalize_mode(old[-1].mode) if old else DEFAULT_MODE,
-            ttl_hours=self.config.session_ttl_hours,
-            note="per Button erneuert",
-        )
+
+        session, token = await self._new_session(guild, member, note="per Verbinden-Button erzeugt")
         self.state.maybe_save(force=True)
-
-        base = self.state.base_url()
-        prompt_ctx = PromptContext(
-            base_url=base, token=token, guild_name=guild.name, guild_id=guild.id,
-            mode_label=MODES.get(session.mode, {}).get("label", session.mode),
-            scope=session.scope, expires_label=session.to_public_dict()["expires_in"],
-            session_id=session.id, member_count=guild.member_count,
-            console_url=f"{base}/console?t={token}",
-        )
-        short = short_prompt(prompt_ctx)
-
-        intro = (
-            "🔄 **Neues Token erzeugt.** Alte Tokens bleiben gültig, bis sie "
-            "ablaufen — mit `/revoke` sofort entziehen.\n"
-            "📋 Neuer Prompt für Arena AI (URL + Token stecken drin):\n\n"
-        )
-        await interaction.followup.send(
-            content=_prompt_message(intro, short),
-            view=RelayButtons(self, prompt_ctx.console_url),
-            ephemeral=True,
+        await self._show(interaction, connected_view(self.state.base_url(), token))
+        log.info(
+            "Verbinden-Button von %s (%s) auf '%s' — Sitzung %s, Token %s, Modus %s.",
+            member.display_name, member.id, guild.name, session.id,
+            session.token_prefix, session.mode,
         )
 
     async def _handle_revoke_all(self, interaction: discord.Interaction) -> None:
-        guild = interaction.guild
+        """Roter „Verbindung trennen“-Button: alle Tokens widerrufen, zurück zum Willkommen."""
         gate = await self._guard(interaction, require_bot_admin=False)
         if gate is None:
             return
         guild = gate["guild"]
         revoked = await self.store.revoke(guild_id=guild.id, by=f"button:{interaction.user.id}")
         self.state.maybe_save(force=True)
-        embed = discord.Embed(
-            title="⛔ Alle KI-Zugriffe widerrufen",
-            description=(
-                f"**{len(revoked)} Token** sofort deaktiviert." if revoked
-                else "Es gab keine aktiven Tokens."
-            ),
-            color=ERR_COLOR,
-            timestamp=now_utc(),
+        await self._show(interaction, welcome_view())
+        log.info(
+            "Verbindung getrennt: %s (%s) hat %d Sitzung(en) auf '%s' widerrufen.",
+            gate["member"].display_name, interaction.user.id, len(revoked), guild.name,
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def _handle_regenerate(self, interaction: discord.Interaction) -> None:
+        """„Neues Token generieren“-Button: alte Tokens ungültig, frisches Token zeigen."""
+        gate = await self._guard(interaction)
+        if gate is None:
+            return
+        guild = gate["guild"]
+        member = gate["member"]
+
+        await self.store.revoke(guild_id=guild.id, by=f"button:{interaction.user.id}")
+        session, token = await self._new_session(guild, member, note="per Button neu generiert")
+        self.state.maybe_save(force=True)
+        await self._show(interaction, connected_view(self.state.base_url(), token))
+        log.info(
+            "Neues Token generiert: %s (%s) auf '%s' — Sitzung %s, Token %s "
+            "(alte Tokens dieser Guild sind ungültig).",
+            member.display_name, member.id, guild.name, session.id, session.token_prefix,
+        )
+
+    async def _show(self, interaction: discord.Interaction, view: discord.ui.LayoutView) -> None:
+        """
+        Bearbeitet die Container-V2-Nachricht, auf der der Button sitzt.
+
+        Components-V2-Nachrichten haben keinen ``content`` — beim Umstylen
+        müssen ``content``/``embeds``/``attachments`` explizit geleert werden
+        (sonst bleibt Alter Content stehen bzw. Discord lehnt ab). Klappt das
+        Bearbeiten nicht mehr (Nachricht weg/zu alt), gibt es eine frische
+        ephemeral Nachricht als Fallback.
+        """
+        try:
+            await interaction.response.edit_message(
+                view=view, content=None, embeds=[], attachments=[],
+            )
+            return
+        except (discord.HTTPException, discord.InteractionResponded) as exc:
+            log.warning("Nachricht konnte nicht bearbeitet werden (%s) — sende eine neue.", exc)
+        try:
+            await interaction.followup.send(view=view, ephemeral=True)
+        except discord.HTTPException as exc:
+            log.error("Ersatznachricht konnte nicht gesendet werden: %s", exc)
 
     # ── Fehlerbehandlung ─────────────────────────────────────────────────────
     async def _on_command_error(
@@ -688,15 +777,6 @@ class RelayClient(discord.Client):
         )
 
 
-def _prompt_message(intro: str, prompt_text: str) -> str:
-    """Intro + Prompt im Codeblock, garantiert unter Discords 2000-Zeichen-Limit."""
-    block = f"```\n{prompt_text}\n```"
-    budget = 1990 - len(intro)
-    if len(block) > budget:
-        block = block[: max(0, budget - 8)] + "\n…\n```"
-    return intro + block
-
-
 def _missing_permissions_text(perms: discord.Permissions) -> str:
     needed = [
         "manage_guild", "manage_channels", "manage_roles", "manage_webhooks",
@@ -725,4 +805,3 @@ def _sessions_text(sessions: List[Any]) -> str:
     if len(sessions) > 8:
         lines.append(f"… und {len(sessions) - 8} weitere")
     return "\n".join(lines)[:1000]
-

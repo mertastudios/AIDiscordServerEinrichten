@@ -182,8 +182,8 @@ kbd{font-family:var(--mono);background:#0e1120;border:1px solid var(--line2);bor
     <button class="btn primary" id="connectBtn">Verbinden</button>
   </div>
   <div class="hint">
-    Tipp: Das Token steht auch in der URL, wenn du den Button <b>„Console öffnen“</b>
-    in Discord benutzt hast (<code>?t=…</code>). Es wird nur in diesem Browser-Tab gehalten
+    Tipp: Das Token steht im Prompt der <b>/connect</b>-Nachricht in Discord
+    (nach dem Klick auf <b>Verbinden</b>). Es wird nur in diesem Browser-Tab gehalten
     und niemals an Dritte gesendet.
   </div>
 </section>

@@ -105,6 +105,19 @@ class Config:
     max_sessions_per_guild: int = 5
     data_dir: str = "data"
     persist_sessions: bool = True
+    session_inactivity_hours: float = 24.0
+    """
+    Inaktivitäts-Stopp: Wird ein Sitzungs-Token so lange nicht benutzt (kein
+    einziger API-Aufruf von Arena AI), stoppt die Bridge die Verbindung
+    automatisch. Ein verfügbares, aber ungenutztes Token ist ein unnötig
+    offenes Tor — „24 Stunden verfügbar, aber 24 Stunden lang hat es niemand
+    benutzt“ reicht als Grund fürs Trennen.
+
+    Gezählt wird ab der letzten Nutzung (oder dem Erstellen, wenn das Token
+    nie benutzt wurde). ``0`` deaktiviert den Inaktivitäts-Stopp; die normale
+    Gültigkeit (``SESSION_TTL_HOURS``) läuft davon unberührt weiter.
+    Prüft der Housekeeping-Loop alle ~15 Sekunden.
+    """
 
     # ── Sicherheit / Limits ────────────────────────────────────────────────
     api_rate_limit: int = 240     # Anfragen pro Token ...
@@ -319,6 +332,7 @@ def load_config() -> Config:
         max_sessions_per_guild=_int("MAX_SESSIONS_PER_GUILD", 5),
         data_dir=_str("DATA_DIR", "data"),
         persist_sessions=_bool("PERSIST_SESSIONS", True),
+        session_inactivity_hours=_float("SESSION_INACTIVITY_HOURS", 24.0),
         api_rate_limit=_int("API_RATE_LIMIT", 240),
         api_rate_window=_int("API_RATE_WINDOW", 60),
         max_body_bytes=_int("MAX_BODY_BYTES", 8 * 1024 * 1024),
@@ -347,6 +361,12 @@ def load_config() -> Config:
 
     if cfg.session_ttl_hours < 0:
         raise ConfigError("SESSION_TTL_HOURS darf nicht negativ sein (0 = unbegrenzt).")
+    if cfg.session_inactivity_hours < 0:
+        raise ConfigError(
+            "SESSION_INACTIVITY_HOURS darf nicht negativ sein (0 = Inaktivitäts-Stopp aus)."
+        )
+    if cfg.session_inactivity_hours > 24 * 366:
+        raise ConfigError("SESSION_INACTIVITY_HOURS darf höchstens 8784 (ein Jahr) sein.")
     if cfg.max_sessions_per_guild < 1:
         raise ConfigError("MAX_SESSIONS_PER_GUILD muss mindestens 1 sein.")
     if not 0.0 <= cfg.settle_scale <= 10.0:
