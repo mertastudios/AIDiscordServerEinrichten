@@ -29,13 +29,24 @@ Die Antwort ist eine **ephemerale Container-V2-Nachricht** (Discord
 
 Die Buttons sind persistent (``timeout=None`` + Registrierung in
 ``setup_hook``): Auch nach einem Render-Deploy reagieren alte Nachrichten noch.
+Der Prompt darin ist bewusst ein **einzeiliger** Codeblock — Discord-Mobile
+kopiert einzeilige Codeboxen mit einem einzigen Tipp, mehrzeilige nicht.
 
 Dazu kommen zwei Sicherheits-Commands: ``/status`` (Rechte-Check) und
 ``/revoke`` (Zugriff sofort entziehen).
+
+**Owner-Features** (``BOT_OWNER_ID``): Die Presence zeigt live
+``/connect | 👀 N eingerichtete Server``. Im Privatchat mit dem Bot gibt es
+``/adminpanel`` — eine durchsuchbare, blätterbare Server-Liste (sortiert nach
+Mitgliederzahl; Server, auf denen der Owner **nicht** Mitglied ist, stehen mit
+❗️ ganz oben). Der Owner bekommt zusätzlich eine DM, wenn der Bot einem Server
+beitritt oder ihn verlässt (mit bestmöglichem Grund), und der Server-Owner
+erhält beim Beitritt eine Willkommens-DM mit der Kurzanleitung.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -80,6 +91,19 @@ CID_REGENERATE = "relay:v2_regenerate"
 CID_LEGACY_REGENERATE = "relay:regenerate"
 CID_LEGACY_REVOKE_ALL = "relay:revoke_all"
 
+#: Adminpanel: Buttons + Suchen-Modal. Die Custom-IDs tragen die Ziel-Seite
+#: und den Suchbegriff in sich (``relay:admin:nav:<seite>:<suche>``), damit
+#: auch alte Panel-Nachrichten nach einem Neustart noch bedienbar sind.
+CID_ADMIN_PREFIX = "relay:admin:"
+CID_ADMIN_SEARCH = "relay:admin:search"
+
+#: Wie viele Server das Adminpanel pro Seite anzeigt.
+ADMIN_PAGE_SIZE = 10
+
+#: Max. Länge des Suchbegriffs im Adminpanel — die Custom-IDs der Blätter-
+#: Buttons transportieren ihn mit und sind auf 100 Zeichen begrenzt.
+ADMIN_QUERY_MAX = 40
+
 
 def build_intents(privileged: bool = True) -> discord.Intents:
     """
@@ -105,21 +129,16 @@ def build_intents(privileged: bool = True) -> discord.Intents:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _bridge_prompt_block(base_url: str, token: str) -> str:
+def _bridge_prompt_line(base_url: str, token: str) -> str:
     """
-    Der Mini-Prompt für Arena AI: **nur** Verbindung und Einstieg.
+    Der Mini-Prompt für Arena AI: **nur** URL und Token — in **einer** Zeile.
 
     Der komplette Regel- und Workflow-Katalog (Hygiene, Personas, Branding,
     Unicode-Design …) muss der Nutzer nicht mehr kopieren — die Bridge erklärt
     sich Arena AI selbst, sobald diese arbeitet: ``GET /api/v1/capabilities``
     liefert Konventionen und Endpoints, dazu die ``/api/v1/guides/*``-Texte.
     """
-    return (
-        "Discord-Bridge für Arena AI\n"
-        f"URL: {base_url}\n"
-        f"TOKEN: {token}\n"
-        f'Start: GET {base_url}/api/v1/capabilities mit Header "Authorization: Bearer TOKEN"'
-    )
+    return f"URL: {base_url} | TOKEN: {token}"
 
 
 def welcome_view() -> discord.ui.LayoutView:
@@ -157,7 +176,13 @@ def connected_view(base_url: str, token: str) -> discord.ui.LayoutView:
         discord.ui.Separator(),
         discord.ui.TextDisplay(
             "**1. Kopiere diesen Prompt:**\n"
-            f"```\n{_bridge_prompt_block(base_url, token)}\n```"
+            # Bewusst EIN einzeiliger Codeblock: Discord-Mobile kopiert
+            # einzeilige Codeboxen mit einem einzigen Tipp — mehrzeilige
+            # Boxen kann man dort nicht per Klick kopieren.
+            f"```{_bridge_prompt_line(base_url, token)}```\n"
+            "*(Alles Weitere erfährt Arena AI automatisch von der Bridge — "
+            f"Start: `GET {base_url}/api/v1/capabilities` mit dem Header "
+            "`Authorization: Bearer <TOKEN>`.)*"
         ),
         discord.ui.Separator(),
         discord.ui.TextDisplay(
@@ -214,6 +239,240 @@ def _button_registration_view() -> discord.ui.LayoutView:
         )
     )
     return view
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Adminpanel (Container V2, nur für den Bot-Owner im Privatchat)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _admin_custom_id(action: str, page: int, query: str) -> str:
+    """Baut eine Admin-Custom-ID: Seite + Suchbegriff reisen in der ID mit."""
+    return f"{CID_ADMIN_PREFIX}{action}:{page}:{query[:ADMIN_QUERY_MAX]}"
+
+
+def _parse_admin_custom_id(custom_id: str) -> Optional[Dict[str, Any]]:
+    """Zerlegt ``relay:admin:<action>:<seite>:<suche>`` — ``None`` wenn unpassend."""
+    if not custom_id.startswith(CID_ADMIN_PREFIX):
+        return None
+    rest = custom_id[len(CID_ADMIN_PREFIX):]
+    action, _, tail = rest.partition(":")
+    page_raw, _, query = tail.partition(":")
+    try:
+        page = max(0, int(page_raw))
+    except ValueError:
+        page = 0
+    return {"action": action, "page": page, "query": query[:ADMIN_QUERY_MAX]}
+
+
+def admin_panel_view(
+    entries: List[Dict[str, Any]],
+    *,
+    page: int,
+    query: str,
+    total_guilds: int,
+) -> discord.ui.LayoutView:
+    """
+    Baut das Adminpanel aus **vorsortierten** Einträgen
+    (``{"guild", "member_count", "owner_present"}``).
+
+    Sortiert hat :meth:`RelayClient._collect_admin_guilds`: Server ohne
+    Bot-Owner zuerst (❗️), dann Mitglieder abwärts. Suchbegriff und Seitenzahl
+    stecken in den Custom-IDs der Buttons — so bleibt auch ein altes Panel
+    nach einem Neustart bedienbar (Dispatch via ``on_interaction``).
+    """
+    page_size = ADMIN_PAGE_SIZE
+    total = len(entries)
+    pages = max(1, -(-total // page_size))          # aufrunden ohne math.ceil
+    page = max(0, min(page, pages - 1))
+    chunk = entries[page * page_size:(page + 1) * page_size]
+
+    lines: List[str] = []
+    for entry in chunk:
+        guild = entry["guild"]
+        marker = "" if entry["owner_present"] else "❗️ "
+        count = f"{entry['member_count']:,}".replace(",", ".")
+        lines.append(f"{marker}**{guild.name}** · {count} Mitglieder")
+    if not lines:
+        lines.append("Keine Server gefunden." if query else "Der Bot ist auf keinem Server.")
+
+    header = f"🛠️ Adminpanel · {total_guilds} Server gesamt · {total} angezeigt"
+    if query:
+        header += f" · Suche: „{query}“"
+    legend = "❗️ = Du bist auf diesem Server noch **nicht** Mitglied — die stehen ganz oben."
+    footer = f"Seite {page + 1}/{pages} · Sortierung: ❗️-Server zuerst, dann Mitgliederzahl"
+
+    buttons = [
+        discord.ui.Button(
+            label="Zurück", emoji="◀️", style=discord.ButtonStyle.secondary,
+            custom_id=_admin_custom_id("nav", page - 1, query), disabled=page <= 0,
+        ),
+        discord.ui.Button(
+            label="Suchen", emoji="🔍", style=discord.ButtonStyle.primary,
+            custom_id=CID_ADMIN_SEARCH,
+        ),
+        discord.ui.Button(
+            label="Weiter", emoji="▶️", style=discord.ButtonStyle.secondary,
+            custom_id=_admin_custom_id("nav", page + 1, query), disabled=page >= pages - 1,
+        ),
+    ]
+    if query:
+        buttons.append(discord.ui.Button(
+            label="Suche löschen", emoji="✖️", style=discord.ButtonStyle.secondary,
+            custom_id=_admin_custom_id("nav", 0, ""),
+        ))
+
+    container = discord.ui.Container(
+        discord.ui.TextDisplay(f"# {header}"),
+        discord.ui.TextDisplay(legend),
+        discord.ui.Separator(),
+        discord.ui.TextDisplay("\n".join(lines)),
+        discord.ui.Separator(),
+        discord.ui.TextDisplay(footer),
+        discord.ui.ActionRow(*buttons),
+        accent_colour=WELCOME_ACCENT,
+    )
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
+class AdminSearchModal(discord.ui.Modal, title="🔍 Server suchen"):
+    """Das Such-Fenster des Adminpanels — nach Absenden startet die Liste bei Seite 1."""
+
+    query = discord.ui.TextInput(
+        label="Servername (Teile genügen)",
+        placeholder="z. B. Community",
+        max_length=ADMIN_QUERY_MAX,
+        required=False,
+    )
+
+    def __init__(self, client: "RelayClient") -> None:
+        super().__init__(timeout=300)
+        self.client = client
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        query = (self.query.value or "").strip()
+        entries = await self.client._collect_admin_guilds()
+        if query:
+            lowered = query.lower()
+            entries = [e for e in entries if lowered in e["guild"].name.lower()]
+        view = admin_panel_view(entries, page=0, query=query, total_guilds=len(self.client.guilds))
+        try:
+            await interaction.response.send_message(view=view)
+        except discord.HTTPException as exc:
+            log.error("Adminpanel-Suche konnte nicht antworten: %s", exc)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:  # type: ignore[override]
+        log.exception("Fehler im Adminpanel-Suchfenster.", exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"⚠️ Suche fehlgeschlagen: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"⚠️ Suche fehlgeschlagen: {error}", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Owner-Benachrichtigungen (Container V2 mit Server-Icon)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _guild_header_section(guild: discord.Guild, title: str, detail_lines: List[str]) -> Any:
+    """
+    Kopfzeile einer Guild-DM: Titel + Details, das Server-Icon als Thumbnail.
+
+    Gibt ein ``Section`` zurück — ohne Icon als Accessory einfach mit einem
+    leeren TextDisplay, damit die Optik stabil bleibt.
+    """
+    icon = getattr(guild, "icon", None)
+    text = discord.ui.TextDisplay(f"## {title}\n" + "\n".join(detail_lines))
+    if icon is not None:
+        try:
+            return discord.ui.Section(text, accessory=discord.ui.Thumbnail(str(icon.url)))
+        except Exception:  # noqa: BLE001 — Icon darf den Aufbau nie sprengen
+            pass
+    return discord.ui.Section(text, accessory=discord.ui.TextDisplay(""))
+
+
+def _owner_line(guild: discord.Guild, owner: Optional[Any]) -> str:
+    if owner is not None:
+        return f"Owner: {owner.mention} ({getattr(owner, 'name', '?')})"
+    return f"Owner: <@{guild.owner_id}> (Konnte nicht geladen werden)"
+
+
+def guild_join_notify_view(guild: discord.Guild, owner: Optional[Any]) -> discord.ui.LayoutView:
+    """DM an den Bot-Owner: der Bot ist einem Server beigetreten."""
+    count = f"{(guild.member_count or 0):,}".replace(",", ".")
+    container = discord.ui.Container(
+        _guild_header_section(
+            guild,
+            f"🟢 Server beigetreten: {guild.name}",
+            [f"Mitglieder: **{count}**", _owner_line(guild, owner), f"ID: `{guild.id}`"],
+        ),
+        accent_colour=OK_COLOR,
+    )
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
+def guild_remove_notify_view(
+    guild: discord.Guild, owner: Optional[Any], reason: str
+) -> discord.ui.LayoutView:
+    """DM an den Bot-Owner: der Bot hat einen Server verlassen (mit bestmöglichem Grund)."""
+    count = f"{(guild.member_count or 0):,}".replace(",", ".")
+    container = discord.ui.Container(
+        _guild_header_section(
+            guild,
+            f"🔴 Server verlassen: {guild.name}",
+            [f"Mitglieder: **{count}**", _owner_line(guild, owner), f"ID: `{guild.id}`"],
+        ),
+        discord.ui.Separator(),
+        discord.ui.TextDisplay(f"**Grund:** {reason}"),
+        accent_colour=ERR_COLOR,
+    )
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
+def server_owner_welcome_view(guild: discord.Guild) -> discord.ui.LayoutView:
+    """
+    DM an den Server-Owner direkt nach dem Beitritt: die Kurzanleitung.
+
+    Bewusst freundlich und kurz — wer den Bot einlädt, soll in 30 Sekunden
+    wissen, wie er Arena AI auf seinem Server arbeiten lässt.
+    """
+    container = discord.ui.Container(
+        discord.ui.TextDisplay("# Hey! 👋"),
+        discord.ui.TextDisplay(
+            f"Danke, dass du mich auf **{guild.name}** eingeladen hast!\n\n"
+            "Mit mir kannst du **Arena AI direkt auf deinem Discord-Server arbeiten "
+            "lassen** — sie richtet dir alles ein: Rollen, Kanäle, Kategorien, "
+            "Rechte, AutoMod, Branding, Willkommens-Nachrichten … einfach alles, "
+            "was dein Server braucht."
+        ),
+        discord.ui.Separator(),
+        discord.ui.TextDisplay(
+            "**So startest du (dauert keine 2 Minuten):**\n"
+            f"1. Geh auf deinen Server **{guild.name}**\n"
+            "2. Nutze den Command `/connect`\n"
+            "3. Klicke auf **Verbinden** und schick Arena AI den Prompt aus der "
+            "Nachricht — dann verstehst du schon alles."
+        ),
+        discord.ui.Separator(),
+        discord.ui.TextDisplay(
+            "Es geht wirklich schnell — und für die Einrichtung deines Servers "
+            "spare ich dir massig Zeit. 🚀"
+        ),
+        accent_colour=WELCOME_ACCENT,
+    )
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -327,11 +586,7 @@ class RelayClient(discord.Client):
         log.info("═" * 68)
 
         try:
-            presence = discord.Activity(
-                type=discord.ActivityType.playing, name=self.config.activity_text
-            )
-            status = getattr(discord.Status, self.config.status_presence, discord.Status.online)
-            await self.change_presence(activity=presence, status=status)
+            await self._update_presence()
         except discord.HTTPException as exc:
             log.warning("Presence konnte nicht gesetzt werden: %s", exc)
 
@@ -341,6 +596,25 @@ class RelayClient(discord.Client):
         log.info("Server beigetreten: %s (%d Mitglieder, ID %s)",
                  guild.name, guild.member_count, guild.id)
         self._check_guild_permissions()
+        await self._update_presence()
+        # Owner informieren (Bot-Owner per DM) und dem Server-Owner die
+        # Kurzanleitung schicken — beides darf den Join niemals stören.
+        try:
+            await self._notify_owner_join(guild)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Join-Benachrichtigung fehlgeschlagen: %s", exc)
+        try:
+            await self._welcome_server_owner(guild)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Willkommens-DM fehlgeschlagen: %s", exc)
+
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        log.info("Server verlassen: %s (ID %s)", guild.name, guild.id)
+        await self._update_presence()
+        try:
+            await self._notify_owner_remove(guild)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Leave-Benachrichtigung fehlgeschlagen: %s", exc)
 
     async def on_resumed(self) -> None:
         log.info("Gateway-Verbindung wiederhergestellt.")
@@ -385,6 +659,196 @@ class RelayClient(discord.Client):
                 "setzen, sonst funktioniert der Link für Arena AI nicht."
             )
         return None
+
+    # ── Presence & Owner-Benachrichtigungen ──────────────────────────────────
+    def _presence_text(self) -> str:
+        """
+        Der Live-Status: ``/connect | 👀 N eingerichtete Server``.
+
+        Die Zahl ist die Anzahl der Server, auf denen der Bot ist — sie wird
+        bei jedem Join/Leave aktualisiert.
+        """
+        count = len(self.guilds)
+        server_word = "eingerichteter Server" if count == 1 else "eingerichtete Server"
+        return f"/{self.config.command_name} | 👀 {count} {server_word}"
+
+    async def _update_presence(self) -> None:
+        """Setzt den Live-Status (Aufruf bei on_ready und jedem Server-Wechsel)."""
+        presence = discord.Activity(type=discord.ActivityType.playing, name=self._presence_text())
+        status = getattr(discord.Status, self.config.status_presence, discord.Status.online)
+        await self.change_presence(activity=presence, status=status)
+
+    def _bot_owner(self) -> Optional[discord.abc.User]:
+        """Der Bot-Owner als User-Objekt (Cache, sonst REST — darf None sein)."""
+        owner_id = int(getattr(self.config, "bot_owner_id", 0) or 0)
+        if not owner_id:
+            return None
+        return self.get_user(owner_id)
+
+    async def _dm_user(self, user: Optional[discord.abc.User], view: discord.ui.LayoutView,
+                       *, context: str) -> bool:
+        """
+        Schickt eine Container-V2-DM — robust gegen geschlossene DMs.
+
+        Geschlossene DMs oder andere Fehler dürfen den Ablauf niemals abreißen
+        lassen; es wird nur geloggt, ob es geklappt hat.
+        """
+        if user is None:
+            log.debug("DM (%s) übersprungen — Zielnutzer unbekannt.", context)
+            return False
+        try:
+            await user.send(view=view)
+            return True
+        except discord.Forbidden:
+            log.info("DM (%s) an %s nicht möglich — DMs sind geschlossen.",
+                     context, getattr(user, "id", "?"))
+        except discord.HTTPException as exc:
+            log.warning("DM (%s) an %s fehlgeschlagen: %s", context, getattr(user, "id", "?"), exc)
+        return False
+
+    async def _notify_owner_join(self, guild: discord.Guild) -> None:
+        """DM an den Bot-Owner: Name, Mitgliederzahl, Icon, Owner-Mention."""
+        owner_id = int(getattr(self.config, "bot_owner_id", 0) or 0)
+        if not owner_id:
+            return
+        bot_owner = self._bot_owner() or None
+        guild_owner = guild.owner
+        if guild_owner is None:
+            try:
+                guild_owner = await guild.fetch_member(guild.owner_id)
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                guild_owner = None
+        sent = await self._dm_user(
+            bot_owner, guild_join_notify_view(guild, guild_owner),
+            context=f"Join-Info {guild.id}",
+        )
+        if not sent:
+            log.info("Join auf '%s' (ID %s, %s Mitglieder) konnte nicht per DM gemeldet werden.",
+                     guild.name, guild.id, guild.member_count)
+
+    async def _welcome_server_owner(self, guild: discord.Guild) -> None:
+        """
+        DM an den Server-Owner direkt nach dem Beitritt: die Kurzanleitung.
+
+        Das ist die wichtigste DM überhaupt — sie erklärt, wie man Arena AI
+        auf dem eigenen Server arbeiten lässt (``/connect`` → Verbinden).
+        """
+        target = guild.owner
+        if target is None:
+            try:
+                target = await guild.fetch_member(guild.owner_id)
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                target = None
+        await self._dm_user(target, server_owner_welcome_view(guild),
+                             context=f"Willkommen {guild.id}")
+
+    async def _leave_reason(self, guild: discord.Guild) -> str:
+        """
+        Bestmöglicher Grund, warum der Bot den Server verlassen hat.
+
+        Ehrlich gesagt: Nach dem Entfernen hat der Bot **keinen Zugriff mehr**
+        auf das Audit-Log des Servers — der Grund ist deshalb meist nicht
+        ermittelbar. Der Versuch kostet aber nichts (kurzes Zeitfenster, bis
+        Discord die Rechte durchzieht), und wenn er durchgeht, gibt es den
+        echten Grund inklusive Ausführendem.
+        """
+        await asyncio.sleep(1.5)  # Audit-Einträge brauchen einen Moment zum Anlegen
+        try:
+            async for entry in guild.audit_logs(limit=15):
+                target_id = getattr(getattr(entry, "target", None), "id", None)
+                if target_id != (self.user.id if self.user else -1):
+                    continue
+                if entry.action in (discord.AuditLogAction.kick, discord.AuditLogAction.ban):
+                    action = "gekickt" if entry.action is discord.AuditLogAction.kick else "gebannt"
+                    executor = getattr(entry, "user", None)
+                    by = f" von **{executor}**" if executor else ""
+                    reason = entry.reason or "kein Grund angegeben"
+                    return f"Bot wurde {action}{by} — Grund: {reason}"
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+            pass
+        except Exception as exc:  # noqa: BLE001 — der Grund darf nie crashen
+            log.debug("Audit-Log-Lookup nach Leave fehlgeschlagen: %s", exc)
+        return (
+            "nicht ermittelbar — nach dem Entfernen hat der Bot keinen Zugriff mehr auf "
+            "das Audit-Log des Servers. Typische Ursachen: gekickt (ggf. mit Grund), "
+            "gebannt oder der Server wurde gelöscht."
+        )
+
+    async def _notify_owner_remove(self, guild: discord.Guild) -> None:
+        """DM an den Bot-Owner: Name, Mitgliederzahl, Icon, Owner-Mention + Grund."""
+        owner_id = int(getattr(self.config, "bot_owner_id", 0) or 0)
+        if not owner_id:
+            return
+        bot_owner = self._bot_owner() or None
+        reason = await self._leave_reason(guild)
+        sent = await self._dm_user(
+            bot_owner, guild_remove_notify_view(guild, guild.owner, reason),
+            context=f"Leave-Info {guild.id}",
+        )
+        if not sent:
+            log.warning(
+                "Verlassen von '%s' (ID %s) konnte nicht per DM gemeldet werden. Grund: %s",
+                guild.name, guild.id, reason,
+            )
+
+    # ── Adminpanel ───────────────────────────────────────────────────────────
+    async def _collect_admin_guilds(self) -> List[Dict[str, Any]]:
+        """
+        Alle Server des Bots als sortierte Einträge fürs Adminpanel.
+
+        Sortierung: Server, auf denen der Bot-Owner **nicht** Mitglied ist,
+        kommen zuerst (im Panel mit ❗️), danach jeweils Mitglieder abwärts.
+
+        Ist der Mitglieder-Cache vollständig (privilegiertes Intent, guild ist
+        ``chunked``), genügt ein Blick in den Cache; sonst wird pro Server
+        einmal per REST nachgeprüft.
+        """
+        owner_id = int(getattr(self.config, "bot_owner_id", 0) or 0)
+        entries: List[Dict[str, Any]] = []
+        for guild in self.guilds:
+            owner_present = owner_id != 0 and guild.get_member(owner_id) is not None
+            if not owner_present and owner_id and not guild.chunked:
+                try:
+                    await guild.fetch_member(owner_id)
+                    owner_present = True
+                except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                    owner_present = False
+            entries.append({
+                "guild": guild,
+                "member_count": guild.member_count or 0,
+                "owner_present": owner_present,
+            })
+        entries.sort(key=lambda e: (e["owner_present"], -e["member_count"]))
+        return entries
+
+    async def _admin_panel_view(self, *, page: int = 0, query: str = "") -> discord.ui.LayoutView:
+        """Sammelt die Serverdaten und baut das Panel (Suchfilter inklusive)."""
+        entries = await self._collect_admin_guilds()
+        if query:
+            lowered = query.strip().lower()
+            entries = [e for e in entries if lowered in e["guild"].name.lower()]
+        return admin_panel_view(entries, page=page, query=query.strip(), total_guilds=len(self.guilds))
+
+    async def _handle_admin_button(self, interaction: discord.Interaction, custom_id: str) -> None:
+        """Blättern/Suche im Adminpanel — nur für den Bot-Owner im Privatchat."""
+        if interaction.guild is not None:
+            return  # Panel lebt ausschließlich im Privatchat
+        if int(getattr(self.config, "bot_owner_id", 0) or 0) == 0:
+            return
+        if interaction.user.id != self.config.bot_owner_id:
+            log.warning("Adminpanel-Klick von %s — nicht der Bot-Owner.",
+                        getattr(interaction.user, "id", "?"))
+            return
+
+        parsed = _parse_admin_custom_id(custom_id)
+        if parsed is None:
+            return
+        if parsed["action"] == "search":
+            await interaction.response.send_modal(AdminSearchModal(self))
+            return
+
+        view = await self._admin_panel_view(page=parsed["page"], query=parsed["query"])
+        await self._show(interaction, view)
 
     async def _new_session(self, guild: discord.Guild, member: discord.Member, *, note: str):
         """
@@ -562,6 +1026,37 @@ class RelayClient(discord.Client):
             log.info("%s hat %d Sitzung(en) auf '%s' widerrufen.", member.display_name,
                      len(revoked), guild.name)
 
+        @self.tree.command(
+            name="adminpanel",
+            description="🛠️ Server-Übersicht für den Bot-Owner (nur im Privatchat)",
+        )
+        async def adminpanel(interaction: discord.Interaction) -> None:
+            """Das Adminpanel: Server-Liste mit Suche und Blättern — Owner-only."""
+            if interaction.guild is not None:
+                await self._deny(
+                    interaction, "Nur im Privatchat",
+                    "Das Adminpanel funktioniert ausschließlich im **Privatchat mit dem Bot** — "
+                    "die Serverliste ist nichts für öffentliche Channels.",
+                )
+                return
+            if not self.config.bot_owner_id or interaction.user.id != self.config.bot_owner_id:
+                await self._deny(
+                    interaction, "Nur für den Bot-Owner",
+                    "Dieser Command ist reserviert für den Besitzer dieses Bots.",
+                )
+                log.warning("adminpanel-Versuch von %s (%s) — nicht der Bot-Owner.",
+                            interaction.user.name, interaction.user.id)
+                return
+
+            # Das Sammeln der Serverdaten kann (ohne privilegierte Intents)
+            # ein paar REST-Aufrufe kosten — erst deferigen, dann liefern.
+            await interaction.response.defer()
+            view = await self._admin_panel_view(page=0, query="")
+            try:
+                await interaction.followup.send(view=view)
+            except discord.HTTPException as exc:
+                log.error("Adminpanel konnte nicht gesendet werden: %s", exc)
+
         # Hinweis: pro-Command on_error ist hier NICHT nötig — discord.py ruft
         # bei einem Fehler SOWOHL command.on_error ALS AUCH tree.on_error auf
         # (siehe CommandTree._dispatch_error). tree.on_error ist bereits in
@@ -661,6 +1156,8 @@ class RelayClient(discord.Client):
             await self._handle_revoke_all(interaction)
         elif custom_id in (CID_REGENERATE, CID_LEGACY_REGENERATE):
             await self._handle_regenerate(interaction)
+        elif custom_id.startswith(CID_ADMIN_PREFIX):
+            await self._handle_admin_button(interaction, custom_id)
 
     async def _handle_connect(self, interaction: discord.Interaction) -> None:
         """Grüner „Verbinden“-Button: erzeugt das Token und bearbeitet die Nachricht."""

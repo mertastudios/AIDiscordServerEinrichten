@@ -18,15 +18,16 @@
 2. [Schnellstart (≈ 15 Minuten)](#schnellstart)
 3. [Betrieb auf einem eigenen Server (VPS / Fly.io / Proxy)](#betrieb-auf-einem-eigenen-server)
 4. [Der `/connect`-Command](#der-connect-command)
-5. [Sicherheitsmodell](#sicherheitsmodell)
-6. [Die REST-API](#die-rest-api)
-7. [Die Console](#die-console)
-8. [UptimeRobot — Bot dauerhaft online halten](#uptimerobot)
-9. [Konfiguration](#konfiguration)
-10. [Lokal entwickeln](#lokal-entwickeln)
-11. [Tests](#tests)
-12. [Fehlerbehebung](#fehlerbehebung)
-13. [Projektstruktur](#projektstruktur)
+5. [Owner-Features: Presence, Adminpanel & Benachrichtigungen](#owner-features)
+6. [Sicherheitsmodell](#sicherheitsmodell)
+7. [Die REST-API](#die-rest-api)
+8. [Die Console](#die-console)
+9. [UptimeRobot — Bot dauerhaft online halten](#uptimerobot)
+10. [Konfiguration](#konfiguration)
+11. [Lokal entwickeln](#lokal-entwickeln)
+12. [Tests](#tests)
+13. [Fehlerbehebung](#fehlerbehebung)
+14. [Projektstruktur](#projektstruktur)
 
 ---
 
@@ -363,6 +364,58 @@ Jeder abgelehnte Versuch wird im Render-Log protokolliert.
 
 ---
 
+---
+
+## Owner-Features: Presence, Adminpanel & Benachrichtigungen
+
+Wer den Bot betreibt, will den Überblick behalten — ohne Discord Developer
+Portal oder Render-Logs zu öffnen. Drei Dinge laufen von selbst:
+
+### Live-Presence
+
+Der Statustext des Bots zeigt jederzeit, auf wie vielen Servern er aktiv ist:
+
+```
+/connect | 👀 12 eingerichtete Server
+```
+
+Bei jedem Server-Beitritt und -Verlassen aktualisiert sich die Zahl sofort
+(Singular bei einem Server: *1 eingerichteter Server*).
+
+### `/adminpanel` — die Server-Liste im Privatchat
+
+Nur für den Bot-Besitzer (`BOT_OWNER_ID`), und nur im **Privatchat mit dem
+Bot** — in Server-Channels verweigert sich der Command. Die Liste zeigt:
+
+- **Sortiert nach Mitgliederzahl, abwärts** — die größten Server zuerst.
+- **Höchste Priorität:** Server, auf denen der Bot-Owner **noch nicht
+  Mitglied** ist, stehen ganz oben und tragen ein ❗️ — genau die Server, bei
+  denen ein Blick lohnt.
+- **Pagination** (◀️ Zurück / ▶️ Weiter, 10 pro Seite) und **Suche** 🔍
+  (öffnet ein Eingabefenster, filtert auf Teiltreffer im Servernamen).
+
+Auch die Panel-Buttons überleben einen Neustart: Seite und Suchbegriff
+reisen in den Custom-IDs der Buttons mit — ein altes Panel bleibt bedienbar.
+
+### DM-Benachrichtigungen bei Beitritt & Verlassen
+
+Der Bot-Owner bekommt bei jedem Server-Wechsel eine DM (Container V2 mit
+Server-Icon, falls vorhanden): Servername, Mitgliederzahl und Owner-Mention.
+Beim **Verlassen** enthält die DM zusätzlich den Grund — sofern er ermittelbar
+ist. Ehrlich gesagt: Nach dem Entfernen hat der Bot keinen Zugriff mehr auf
+das Audit-Log des Servers, deshalb liefert Discord den Grund meist nicht.
+Der Bot versucht es trotzdem (Kick/Ban-Eintrag inkl. Ausführendem und
+Begründung) und sagt dir andernfalls offen, dass der Grund nicht ermittelbar
+ist — statt etwas zu erfinden.
+
+### Willkommens-DM an den Server-Owner
+
+Der wichtigste Moment ist der Beitritt: Der Owner des Servers, zu dem der Bot
+gerade gejoint ist, bekommt sofort eine DM mit der Kurzanleitung — dankend,
+kurz, mit dem Servernamen und dem einzigen Schritt, der zählt: `/connect`
+auf dem eigenen Server, auf **Verbinden** klicken, den Prompt an Arena AI
+schicken. Dauert keine zwei Minuten, dann arbeitet Arena AI auf dem Server.
+
 ## Sicherheitsmodell
 
 | Maßnahme | Umsetzung |
@@ -615,8 +668,8 @@ Eine kommentierte Vorlage liegt in [`.env.example`](.env.example).
 | `PORT` | `8080` | Wird von Render automatisch gesetzt. |
 | `COMMAND_NAME` | `connect` | Name des Slash-Commands. |
 | `BOT_NAME` | `AIDiscordServerEinrichten` | Anzeigename in Antworten. |
-| `ACTIVITY_TEXT` | `/connect · KI-Steuerung …` | Presence-Text des Bots. |
-| `PRESENCE_STATUS` | `online` | `online` / `idle` / `dnd` / `invisible`. |
+| `PRESENCE_STATUS` | `online` | `online` / `idle` / `dnd` / `invisible`. Der Statustext ist live: `/connect \| 👀 N eingerichtete Server`. |
+| `BOT_OWNER_ID` | *(fest)* | Discord-User-ID des Bot-Besitzers. Schaltet `/adminpanel` im Privatchat und die DM-Benachrichtigungen bei Server-Beitritt/-Verlassen frei. `0` = aus. |
 | `SESSION_TTL_HOURS` | `24` | Standard-Gültigkeit eines Tokens. `0` = unbegrenzt. |
 | `SESSION_INACTIVITY_HOURS` | `24` | Verbindung wird automatisch gestoppt, wenn das Token so lange ungenutzt bleibt. `0` = aus. |
 | `MAX_SESSIONS_PER_GUILD` | `5` | Aktive Tokens pro Server, bevor das älteste widerrufen wird. |
@@ -692,7 +745,7 @@ python scripts/smoke_test.py          # 274 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
-python scripts/login_recovery_test.py # 146 Prüfungen: Login/Rate-Limit + Client-Setup
+python scripts/login_recovery_test.py # 176 Prüfungen: Login/Rate-Limit + Client-Setup + Owner-Features
 python -m bot.netcheck                # echte Netz-Diagnose (IP + discord.com)
 ```
 
@@ -911,7 +964,7 @@ AIDiscordServerEinrichten/
 ├── bot/
 │   ├── main.py              Einstiegspunkt: Bot + Web-Server in einem Loop
 │   ├── __main__.py          python -m bot
-│   ├── discord_bot.py       /connect, /status, /revoke, Container-V2-Buttons, Rechteprüfungen
+│   ├── discord_bot.py       /connect, /status, /revoke, /adminpanel, Container-V2-Buttons, Presence, Owner-DMs
 │   ├── config.py            Umgebungsvariablen, Validierung, maskierte Ausgabe
 │   ├── netcheck.py          Netz-Diagnose: ausgehende IP + discord.com-Probe
 │   ├── restarts.py          Neustart-Buch: Zyklen + gesehene IPs über Prozessgrenzen
@@ -945,7 +998,7 @@ AIDiscordServerEinrichten/
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
 │   ├── smoke_test.py        274 Prüfungen ohne Discord-Verbindung
-│   ├── login_recovery_test.py 146 Prüfungen: 429/1015 + Client-Setup (Fake-Uhr)
+│   ├── login_recovery_test.py 176 Prüfungen: 429/1015 + Client-Setup + Owner-Features
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double
 ├── deploy/
 │   ├── docker-compose.yml   VPS: Bot + Caddy (HTTPS) aus dem vorhandenen Dockerfile
