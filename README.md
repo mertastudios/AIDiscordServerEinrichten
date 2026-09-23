@@ -751,11 +751,11 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 280 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 283 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
-python scripts/login_recovery_test.py # 194 Prüfungen: Login/Rate-Limit + Client-Setup + Owner-Features
+python scripts/login_recovery_test.py # 201 Prüfungen: Login/Rate-Limit + Client-Setup + Owner-Features
 python -m bot.netcheck                # echte Netz-Diagnose (IP + discord.com)
 ```
 
@@ -818,6 +818,20 @@ und verlangt `/api/health` im laufenden Container.
 ---
 
 ## Fehlerbehebung
+
+**`/adminpanel` hängt endlos bei „Bot denkt nach…“ und endet mit „Die Anwendung reagiert nicht“**
+Versionen vor **1.0.4** konnten die Server-Liste nicht senden, sobald
+mindestens ein Server dabei war, auf dem der Bot-Owner (noch) **kein
+Mitglied** ist (❗️-Markierung): Der Zeilen-Marker im Suchfeld nutzt ein
+vollständiges Emoji mit Variation-Selector (`❗️` = U+2757 + U+FE0F). Discord
+akzeptiert diese Sequenz bei **Buttons** klaglos, lehnt sie aber bei
+**Select-Menü-Optionen** mit `400 Invalid Form Body — Invalid emoji` ab (eine
+bekannte Inkonsistenz der Discord-API). `defer()` war dabei immer erfolgreich
+— erst der `followup.send()` mit der fertigen Liste scheiterte, weshalb der
+Client bis zum Timeout „Bot denkt nach…“ zeigte. Auf `main` aktualisieren
+(`/api/health` → `version` sollte `1.0.4` oder neuer sein) und `/adminpanel`
+erneut ausführen. Im Render-Log steht bei diesem Fehler
+`followup.send() fehlgeschlagen … discord_error_code=…`.
 
 **`AttributeError: 'RelayClient' object has no attribute 'add_listener'` im Log**
 Versionen vor **1.0.1** hatten einen Fehler in `setup_hook()` (Bot-only-API auf
@@ -1007,8 +1021,8 @@ AIDiscordServerEinrichten/
 │           ├── events.py    Scheduled Events
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        280 Prüfungen ohne Discord-Verbindung
-│   ├── login_recovery_test.py 194 Prüfungen: 429/1015 + Client-Setup + Owner-Features
+│   ├── smoke_test.py        283 Prüfungen ohne Discord-Verbindung
+│   ├── login_recovery_test.py 201 Prüfungen: 429/1015 + Client-Setup + Owner-Features
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double
 ├── deploy/
 │   ├── docker-compose.yml   VPS: Bot + Caddy (HTTPS) aus dem vorhandenen Dockerfile
