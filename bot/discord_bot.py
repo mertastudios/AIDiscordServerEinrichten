@@ -590,8 +590,14 @@ def _guild_header_section(guild: discord.Guild, title: str, detail_lines: List[s
     """
     Kopfzeile einer Guild-DM: Titel + Details, das Server-Icon als Thumbnail.
 
-    Gibt ein ``Section`` zurück — ohne Icon als Accessory einfach mit einem
-    leeren TextDisplay, damit die Optik stabil bleibt.
+    Mit Icon: ein ``Section`` mit Thumbnail-Accessory. **Ohne** Icon: ein
+    schlichtes ``TextDisplay``. Der frühere Fallback mit einem leeren
+    ``TextDisplay`` im Accessory-Slot einer Section war **ungültig** —
+    Discord lässt dort ausschließlich *Button* oder *Thumbnail* zu und
+    lehnte die komplette Nachricht mit ``400 Invalid Form Body`` ab. Das war
+    der Grund dafür, dass die Server-Übersicht des Adminpanels (und die
+    Join-/Leave-DMs) für jeden Server **ohne eigenes Icon** mit
+    „Die Anwendung reagiert nicht" abbrachen.
     """
     icon = getattr(guild, "icon", None)
     text = discord.ui.TextDisplay(f"## {title}\n" + "\n".join(detail_lines))
@@ -600,7 +606,10 @@ def _guild_header_section(guild: discord.Guild, title: str, detail_lines: List[s
             return discord.ui.Section(text, accessory=discord.ui.Thumbnail(str(icon.url)))
         except Exception:  # noqa: BLE001 — Icon darf den Aufbau nie sprengen
             pass
-    return discord.ui.Section(text, accessory=discord.ui.TextDisplay(""))
+    # Kein Icon (oder das Icon war nicht serialisierbar): Absichtlich KEINE
+    # Section mit Ersatz-Accessory bauen — ein TextDisplay-Accessory ist für
+    # Discord ungültige Payload (siehe Docstring oben).
+    return text
 
 
 def _owner_line(guild: discord.Guild, owner: Optional[Any]) -> str:
