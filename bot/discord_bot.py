@@ -61,7 +61,11 @@ from .util import ApiError, human_duration, now_utc
 
 log = logging.getLogger("relay.discord")
 
-__all__ = ("RelayClient", "build_intents", "ADMIN_INVITE_SCOPES")
+__all__ = (
+    "RelayClient", "build_intents", "ADMIN_INVITE_SCOPES", "ARENA_URL",
+    "connected_view", "welcome_view", "admin_panel_view",
+    "admin_guild_detail_view", "admin_guild_leave_confirm_view",
+)
 
 ADMIN_INVITE_SCOPES = ("bot", "applications.commands")
 
@@ -73,7 +77,7 @@ WARN_COLOR = discord.Color.from_str("#F1C40F")
 ERR_COLOR = discord.Color.from_str("#E74C3C")
 
 #: Ziel des „Arena AI öffnen“-Link-Buttons.
-ARENA_URL = "https://arena.ai"
+ARENA_URL = "https://arena.ai/agent"
 
 #: Akzentfarbe der Container: Blurple fürs Willkommen, Grün für verbunden.
 WELCOME_ACCENT = discord.Color.from_str("#5865F2")
@@ -176,13 +180,9 @@ def connected_view(base_url: str, token: str) -> discord.ui.LayoutView:
         discord.ui.Separator(),
         discord.ui.TextDisplay(
             "**1. Kopiere diesen Prompt:**\n"
-            # Bewusst EIN einzeiliger Codeblock: Discord-Mobile kopiert
-            # einzeilige Codeboxen mit einem einzigen Tipp — mehrzeilige
-            # Boxen kann man dort nicht per Klick kopieren.
-            f"```{_bridge_prompt_line(base_url, token)}```\n"
-            "*(Alles Weitere erfährt Arena AI automatisch von der Bridge — "
-            f"Start: `GET {base_url}/api/v1/capabilities` mit dem Header "
-            "`Authorization: Bearer <TOKEN>`.)*"
+            # Bewusst EIN einzeiliger Inline-Codeblock mit einfachen Backticks:
+            # Discord-Mobile kopiert diesen mit einem einzigen Tipp.
+            f"`{_bridge_prompt_line(base_url, token)}`"
         ),
         discord.ui.Separator(),
         discord.ui.TextDisplay(
@@ -251,13 +251,37 @@ def _admin_custom_id(action: str, page: int, query: str) -> str:
     return f"{CID_ADMIN_PREFIX}{action}:{page}:{query[:ADMIN_QUERY_MAX]}"
 
 
+def _admin_guild_custom_id(action: str, guild_id: int, page: int, query: str) -> str:
+    """Baut eine Admin-Custom-ID mit Guild-ID: ``relay:admin:<action>:<guild_id>:<seite>:<suche>``."""
+    return f"{CID_ADMIN_PREFIX}{action}:{guild_id}:{page}:{query[:ADMIN_QUERY_MAX]}"
+
+
 def _parse_admin_custom_id(custom_id: str) -> Optional[Dict[str, Any]]:
-    """Zerlegt ``relay:admin:<action>:<seite>:<suche>`` — ``None`` wenn unpassend."""
+    """Zerlegt Admin-Custom-IDs — ``None`` wenn unpassend."""
     if not custom_id.startswith(CID_ADMIN_PREFIX):
         return None
     rest = custom_id[len(CID_ADMIN_PREFIX):]
-    action, _, tail = rest.partition(":")
-    page_raw, _, query = tail.partition(":")
+    parts = rest.split(":")
+    action = parts[0]
+    if action == "search":
+        return {"action": "search", "page": 0, "query": ""}
+
+    if action in ("guild", "invite", "leave", "leave_confirm"):
+        guild_id_raw = parts[1] if len(parts) > 1 else ""
+        try:
+            guild_id: Optional[int] = int(guild_id_raw)
+        except ValueError:
+            guild_id = None
+        page_raw = parts[2] if len(parts) > 2 else "0"
+        query = ":".join(parts[3:]) if len(parts) > 3 else ""
+        try:
+            page = max(0, int(page_raw))
+        except ValueError:
+            page = 0
+        return {"action": action, "guild_id": guild_id, "page": page, "query": query[:ADMIN_QUERY_MAX]}
+
+    page_raw = parts[1] if len(parts) > 1 else "0"
+    query = ":".join(parts[2:]) if len(parts) > 2 else ""
     try:
         page = max(0, int(page_raw))
     except ValueError:
@@ -288,11 +312,23 @@ def admin_panel_view(
     chunk = entries[page * page_size:(page + 1) * page_size]
 
     lines: List[str] = []
+    select_options: List[discord.SelectOption] = []
     for entry in chunk:
         guild = entry["guild"]
         marker = "" if entry["owner_present"] else "❗️ "
         count = f"{entry['member_count']:,}".replace(",", ".")
         lines.append(f"{marker}**{guild.name}** · {count} Mitglieder")
+        desc = f"{count} Mitglieder"
+        if not entry["owner_present"]:
+            desc += " · ❗️ Kein Mitglied"
+        select_options.append(
+            discord.SelectOption(
+                label=getattr(guild, "name", "Server")[:100],
+                value=str(guild.id),
+                description=desc[:100],
+                emoji="❗️" if not entry["owner_present"] else "🏰",
+            )
+        )
     if not lines:
         lines.append("Keine Server gefunden." if query else "Der Bot ist auf keinem Server.")
 
@@ -322,15 +358,171 @@ def admin_panel_view(
             custom_id=_admin_custom_id("nav", 0, ""),
         ))
 
-    container = discord.ui.Container(
+    container_items: List[Any] = [
         discord.ui.TextDisplay(f"# {header}"),
         discord.ui.TextDisplay(legend),
         discord.ui.Separator(),
         discord.ui.TextDisplay("\n".join(lines)),
+    ]
+
+    if select_options:
+        container_items.extend([
+            discord.ui.Separator(),
+            discord.ui.ActionRow(
+                discord.ui.Select(
+                    placeholder="Server für Details auswählen…",
+                    custom_id=_admin_custom_id("select", page, query),
+                    options=select_options,
+                )
+            ),
+        ])
+
+    container_items.extend([
         discord.ui.Separator(),
         discord.ui.TextDisplay(footer),
         discord.ui.ActionRow(*buttons),
+    ])
+
+    container = discord.ui.Container(
+        *container_items,
         accent_colour=WELCOME_ACCENT,
+    )
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
+def _admin_sessions_detail_text(sessions: List[Any]) -> str:
+    """Formatierte Liste aktiver Sitzungen für die Server-Detailansicht."""
+    if not sessions:
+        return ""
+    lines: List[str] = []
+    for s in sessions:
+        info = s.to_public_dict()
+        last_used = f" · zuletzt genutzt: {info['last_used_ago']}" if info.get("last_used_ago") else ""
+        lines.append(
+            f"• `{s.token_prefix}` ({info['mode_label']}) · Ablauf: {info['expires_in']}"
+            f" · {info['request_count']} Requests{last_used} · von {info['created_by_name']}"
+        )
+    return "\n".join(lines)[:1000]
+
+
+def admin_guild_detail_view(
+    guild: discord.Guild,
+    *,
+    owner: Optional[Any],
+    owner_present: bool,
+    sessions: List[Any],
+    page: int,
+    query: str,
+    invite_url: Optional[str] = None,
+    notice: Optional[str] = None,
+) -> discord.ui.LayoutView:
+    """Server-Übersicht (Container V2) im Adminpanel."""
+    count = f"{(guild.member_count or 0):,}".replace(",", ".")
+    owner_str = _owner_line(guild, owner)
+    member_status = "✅ Du bist Mitglied auf diesem Server" if owner_present else "❗️ Du bist auf diesem Server **noch nicht** Mitglied"
+
+    details = [
+        f"**Server-ID:** `{guild.id}`",
+        f"**Mitglieder:** {count}",
+        owner_str,
+        f"**Bot-Owner-Status:** {member_status}",
+    ]
+
+    components: List[Any] = [
+        _guild_header_section(
+            guild,
+            f"🏰 {guild.name}",
+            details,
+        ),
+        discord.ui.Separator(),
+    ]
+
+    if sessions:
+        components.append(
+            discord.ui.TextDisplay(
+                f"**🔗 Aktive KI-Verbindung ({len(sessions)} Token):**\n"
+                f"{_admin_sessions_detail_text(sessions)}"
+            )
+        )
+    else:
+        components.append(
+            discord.ui.TextDisplay(
+                "**🔗 KI-Verbindung:**\n"
+                "⚪ Keine aktiven Tokens — Bridge für diesen Server ist nicht verbunden."
+            )
+        )
+
+    if invite_url:
+        components.extend([
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(
+                f"**✉️ Einladungslink (1 Stunde gültig, 1 Nutzung):**\n<{invite_url}>"
+            ),
+        ])
+
+    if notice:
+        components.extend([
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(f"⚠️ **Hinweis:** {notice}"),
+        ])
+
+    buttons = [
+        discord.ui.Button(
+            label="Zurück", emoji="◀️", style=discord.ButtonStyle.secondary,
+            custom_id=_admin_custom_id("nav", page, query),
+        ),
+        discord.ui.Button(
+            label="Einladung erstellen", emoji="✉️", style=discord.ButtonStyle.primary,
+            custom_id=_admin_guild_custom_id("invite", guild.id, page, query),
+        ),
+        discord.ui.Button(
+            label="Server verlassen", emoji="🚪", style=discord.ButtonStyle.danger,
+            custom_id=_admin_guild_custom_id("leave", guild.id, page, query),
+        ),
+    ]
+
+    components.extend([
+        discord.ui.Separator(),
+        discord.ui.ActionRow(*buttons),
+    ])
+
+    container = discord.ui.Container(
+        *components,
+        accent_colour=CONNECTED_ACCENT if sessions else WELCOME_ACCENT,
+    )
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
+def admin_guild_leave_confirm_view(
+    guild: discord.Guild,
+    *,
+    page: int,
+    query: str,
+) -> discord.ui.LayoutView:
+    """Bestätigungsansicht (Container V2) vor dem Verlassen eines Servers."""
+    container = discord.ui.Container(
+        discord.ui.TextDisplay(f"# ⚠️ Server wirklich verlassen?"),
+        discord.ui.Separator(),
+        discord.ui.TextDisplay(
+            f"Möchtest du wirklich, dass der Bot den Server **{guild.name}** (`{guild.id}`) verlässt?\n\n"
+            "Der Bot wird sofort vom Server entfernt und alle aktiven KI-Zugriffe werden gestoppt."
+        ),
+        discord.ui.Separator(),
+        discord.ui.ActionRow(
+            discord.ui.Button(
+                label="Abbrechen", emoji="◀️", style=discord.ButtonStyle.secondary,
+                custom_id=_admin_guild_custom_id("guild", guild.id, page, query),
+            ),
+            discord.ui.Button(
+                label="Ja, Server verlassen", emoji="🚪", style=discord.ButtonStyle.danger,
+                custom_id=_admin_guild_custom_id("leave_confirm", guild.id, page, query),
+            ),
+        ),
+        accent_colour=ERR_COLOR,
     )
     view = discord.ui.LayoutView(timeout=None)
     view.add_item(container)
@@ -829,8 +1021,53 @@ class RelayClient(discord.Client):
             entries = [e for e in entries if lowered in e["guild"].name.lower()]
         return admin_panel_view(entries, page=page, query=query.strip(), total_guilds=len(self.guilds))
 
+    async def _guild_detail_view(
+        self,
+        guild_or_id: Any,
+        *,
+        page: int = 0,
+        query: str = "",
+        invite_url: Optional[str] = None,
+        notice: Optional[str] = None,
+    ) -> discord.ui.LayoutView:
+        """Baut die Detailansicht eines Servers für das Adminpanel."""
+        if isinstance(guild_or_id, int):
+            guild = self.get_guild(guild_or_id)
+        else:
+            guild = guild_or_id
+        if guild is None:
+            return await self._admin_panel_view(page=page, query=query)
+
+        owner_id = int(getattr(self.config, "bot_owner_id", 0) or 0)
+        owner_present = owner_id != 0 and guild.get_member(owner_id) is not None
+        if not owner_present and owner_id and not getattr(guild, "chunked", True):
+            try:
+                await guild.fetch_member(owner_id)
+                owner_present = True
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                owner_present = False
+
+        guild_owner = getattr(guild, "owner", None)
+        if guild_owner is None and hasattr(guild, "owner_id") and hasattr(guild, "fetch_member"):
+            try:
+                guild_owner = await guild.fetch_member(guild.owner_id)
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                guild_owner = None
+
+        sessions = self.store.active_for_guild(guild.id)
+        return admin_guild_detail_view(
+            guild,
+            owner=guild_owner,
+            owner_present=owner_present,
+            sessions=sessions,
+            page=page,
+            query=query,
+            invite_url=invite_url,
+            notice=notice,
+        )
+
     async def _handle_admin_button(self, interaction: discord.Interaction, custom_id: str) -> None:
-        """Blättern/Suche im Adminpanel — nur für den Bot-Owner im Privatchat."""
+        """Adminpanel-Interaktionen: Blättern, Suchen, Detailansicht, Invite, Leave."""
         if interaction.guild is not None:
             return  # Panel lebt ausschließlich im Privatchat
         if int(getattr(self.config, "bot_owner_id", 0) or 0) == 0:
@@ -843,11 +1080,123 @@ class RelayClient(discord.Client):
         parsed = _parse_admin_custom_id(custom_id)
         if parsed is None:
             return
-        if parsed["action"] == "search":
+
+        action = parsed["action"]
+        page = parsed.get("page", 0)
+        query = parsed.get("query", "")
+
+        if action == "search":
             await interaction.response.send_modal(AdminSearchModal(self))
             return
 
-        view = await self._admin_panel_view(page=parsed["page"], query=parsed["query"])
+        if action == "select":
+            values = (interaction.data or {}).get("values") or []
+            if values:
+                try:
+                    guild_id = int(values[0])
+                    view = await self._guild_detail_view(guild_id, page=page, query=query)
+                    await self._show(interaction, view)
+                    return
+                except ValueError:
+                    pass
+            view = await self._admin_panel_view(page=page, query=query)
+            await self._show(interaction, view)
+            return
+
+        if action == "guild":
+            guild_id = parsed.get("guild_id")
+            if guild_id is not None:
+                view = await self._guild_detail_view(guild_id, page=page, query=query)
+                await self._show(interaction, view)
+            else:
+                view = await self._admin_panel_view(page=page, query=query)
+                await self._show(interaction, view)
+            return
+
+        if action == "invite":
+            guild_id = parsed.get("guild_id")
+            guild = self.get_guild(guild_id) if guild_id else None
+            if guild is None:
+                view = await self._admin_panel_view(page=page, query=query)
+                await self._show(interaction, view)
+                return
+
+            invite_url: Optional[str] = None
+            notice: Optional[str] = None
+            try:
+                # 1. Bevorzugt guild.invites.create() falls implementiert
+                if hasattr(guild, "invites") and hasattr(guild.invites, "create"):
+                    inv = await guild.invites.create(max_uses=1, max_age=3600, reason="Adminpanel-Einladung für den Bot-Owner")
+                    invite_url = getattr(inv, "url", str(inv))
+                else:
+                    # 2. Suche nach passendem Kanal
+                    target_channel = getattr(guild, "system_channel", None) or getattr(guild, "rules_channel", None)
+                    if target_channel is None or not hasattr(target_channel, "create_invite"):
+                        for c in getattr(guild, "text_channels", []) or []:
+                            if hasattr(c, "create_invite"):
+                                target_channel = c
+                                break
+                    if target_channel is None or not hasattr(target_channel, "create_invite"):
+                        for c in getattr(guild, "channels", []) or []:
+                            if hasattr(c, "create_invite"):
+                                target_channel = c
+                                break
+                    if target_channel is None or not hasattr(target_channel, "create_invite"):
+                        notice = "Kein Kanal gefunden, um eine Einladung zu erstellen."
+                    else:
+                        inv = await target_channel.create_invite(
+                            max_uses=1, max_age=3600, reason="Adminpanel-Einladung für den Bot-Owner"
+                        )
+                        invite_url = getattr(inv, "url", str(inv))
+            except discord.Forbidden:
+                notice = "Fehlende Berechtigung: Dem Bot fehlt 'Sofortige Einladung erstellen' (create_instant_invite) auf diesem Server."
+            except Exception as exc:
+                notice = f"Einladung konnte nicht erstellt werden: {exc}"
+
+            view = await self._guild_detail_view(
+                guild, page=page, query=query, invite_url=invite_url, notice=notice
+            )
+            await self._show(interaction, view)
+            return
+
+        if action == "leave":
+            guild_id = parsed.get("guild_id")
+            guild = self.get_guild(guild_id) if guild_id else None
+            if guild is None:
+                view = await self._admin_panel_view(page=page, query=query)
+                await self._show(interaction, view)
+                return
+            view = admin_guild_leave_confirm_view(guild, page=page, query=query)
+            await self._show(interaction, view)
+            return
+
+        if action == "leave_confirm":
+            guild_id = parsed.get("guild_id")
+            guild = self.get_guild(guild_id) if guild_id else None
+            if guild is None:
+                view = await self._admin_panel_view(page=page, query=query)
+                await self._show(interaction, view)
+                return
+            try:
+                await guild.leave()
+                log.info("Bot hat Server '%s' (ID %s) über das Adminpanel verlassen.",
+                         guild.name, guild.id)
+                if hasattr(self, "_connection") and hasattr(self._connection, "_guilds"):
+                    self._connection._guilds.pop(guild.id, None)
+                view = await self._admin_panel_view(page=page, query=query)
+                await self._show(interaction, view)
+            except Exception as exc:
+                log.warning("Server '%s' (ID %s) konnte nicht verlassen werden: %s",
+                            guild.name, guild.id, exc)
+                view = await self._guild_detail_view(
+                    guild, page=page, query=query,
+                    notice=f"Server konnte nicht verlassen werden: {exc} (z. B. wenn der Bot Server-Owner ist)",
+                )
+                await self._show(interaction, view)
+            return
+
+        # nav, back oder sonstige Navigation
+        view = await self._admin_panel_view(page=page, query=query)
         await self._show(interaction, view)
 
     async def _new_session(self, guild: discord.Guild, member: discord.Member, *, note: str):

@@ -215,6 +215,20 @@ class _FakeGuildChannelMixin:
     def is_news(self) -> bool:
         return self.type is discord.ChannelType.news
 
+    async def create_invite(self, **kwargs: Any) -> "FakeInvite":
+        g = getattr(self, "guild", None)
+        inv_list = getattr(g, "created_invites", None)
+        code = f"invite{len(inv_list):03d}" if inv_list is not None else "invite000"
+        inv = FakeInvite(code, self)
+        for k, v in kwargs.items():
+            if hasattr(inv, k):
+                setattr(inv, k, v)
+        if inv_list is not None:
+            inv_list.append(inv)
+        if g and hasattr(g, "mutations"):
+            g.mutations.append(f"create_invite:#{self.name}")
+        return inv
+
 
 class FakeCategory(_FakeGuildChannelMixin, discord.CategoryChannel):
     """Echte ``discord.CategoryChannel``; ``type`` liefert discord.py selbst."""
@@ -652,9 +666,31 @@ class FakeGuild:
         self.invites_disabled = False
         self.mutations: List[str] = []
         self._webhooks: List[Any] = []
+        self.created_invites: List[FakeInvite] = []
+
+        async def _invites_call() -> List[Any]:
+            return list(getattr(self, "_invites_list", []))
+
+        async def _invites_create(**kwargs: Any) -> FakeInvite:
+            channel = self.system_channel or (self.text_channels[0] if self.text_channels else None)
+            invite = FakeInvite(f"panel{len(self.created_invites):03d}", channel)
+            for k, v in kwargs.items():
+                if hasattr(invite, k):
+                    setattr(invite, k, v)
+            self.created_invites.append(invite)
+            self.mutations.append(f"invites.create:{getattr(channel, 'name', 'guild')}")
+            return invite
+
+        _invites_call.create = _invites_create  # type: ignore[attr-defined]
+        self.invites = _invites_call  # type: ignore[assignment]
 
     async def webhooks(self) -> List[Any]:
         return list(self._webhooks)
+
+    async def leave(self) -> None:
+        self.mutations.append("guild.leave")
+        if hasattr(self, "_state") and hasattr(self._state, "_guilds"):
+            self._state._guilds.pop(self.id, None)
 
     # ── interne Pflege ───────────────────────────────────────────────────────
     def _reindex(self) -> None:
@@ -695,9 +731,6 @@ class FakeGuild:
         if member is None:
             raise not_found("Unknown Member")
         return member
-
-    async def invites(self) -> List[Any]:
-        return []
 
     async def fetch_automod_rules(self) -> List[Any]:
         return []

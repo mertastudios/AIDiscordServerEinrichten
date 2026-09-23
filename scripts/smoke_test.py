@@ -842,6 +842,32 @@ async def t_prompt(h: Harness) -> None:
                 "unicode_design", "third_party_bots"):
         check(f"capabilities.conventions nennt '{key}'", key in conventions)
 
+    from bot.discord_bot import (
+        ARENA_URL, _bridge_prompt_line, connected_view,
+        admin_panel_view, admin_guild_detail_view, admin_guild_leave_confirm_view,
+    )
+    p_line = _bridge_prompt_line("https://relay.example.com", "adse_smoke123")
+    check("Bridge-Prompt-Line: nur URL und Token",
+          p_line == "URL: https://relay.example.com | TOKEN: adse_smoke123")
+    cv = connected_view("https://relay.example.com", "adse_smoke123")
+    check("connected_view ist LayoutView (Components V2)", cv.has_components_v2())
+    check("ARENA_URL zeigt auf Agent-Endpoint", ARENA_URL == "https://arena.ai/agent")
+
+    # Adminpanel Views
+    g_smoke = FakeGuild(gid=9999, name="DetailServer")
+    panel_v = admin_panel_view(
+        [{"guild": g_smoke, "member_count": 42, "owner_present": True}],
+        page=0, query="", total_guilds=1,
+    )
+    check("admin_panel_view ist Components V2", panel_v.has_components_v2())
+    detail_v = admin_guild_detail_view(
+        g_smoke, owner=g_smoke.owner, owner_present=True, sessions=[],
+        page=0, query="",
+    )
+    check("admin_guild_detail_view ist Components V2", detail_v.has_components_v2())
+    leave_v = admin_guild_leave_confirm_view(g_smoke, page=0, query="")
+    check("admin_guild_leave_confirm_view ist Components V2", leave_v.has_components_v2())
+
 
 async def t_session_limit(h: Harness) -> None:
     print("── Sitzungs-Limit pro Server ─────────────────────────────────")

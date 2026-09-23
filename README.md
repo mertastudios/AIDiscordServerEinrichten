@@ -382,7 +382,7 @@ Der Statustext des Bots zeigt jederzeit, auf wie vielen Servern er aktiv ist:
 Bei jedem Server-Beitritt und -Verlassen aktualisiert sich die Zahl sofort
 (Singular bei einem Server: *1 eingerichteter Server*).
 
-### `/adminpanel` — die Server-Liste im Privatchat
+### `/adminpanel` — die Server-Liste & Serverdetailansicht im Privatchat
 
 Nur für den Bot-Besitzer (`BOT_OWNER_ID`), und nur im **Privatchat mit dem
 Bot** — in Server-Channels verweigert sich der Command. Die Liste zeigt:
@@ -393,9 +393,27 @@ Bot** — in Server-Channels verweigert sich der Command. Die Liste zeigt:
   denen ein Blick lohnt.
 - **Pagination** (◀️ Zurück / ▶️ Weiter, 10 pro Seite) und **Suche** 🔍
   (öffnet ein Eingabefenster, filtert auf Teiltreffer im Servernamen).
+- **Serverauswahl per Dropdown** (Select-Menü der aktuellen Seite): Öffnet
+  sofort die **Server-Übersicht**.
 
-Auch die Panel-Buttons überleben einen Neustart: Seite und Suchbegriff
-reisen in den Custom-IDs der Buttons mit — ein altes Panel bleibt bedienbar.
+#### Server-Übersicht (Detailansicht)
+- **Server-Details:** Name, Server-ID, Mitgliederzahl, Owner-Mention und
+  Status, ob der Bot-Owner Mitglied auf diesem Server ist.
+- **KI-Verbindungsstatus:** Zeigt sofort an, ob die Bridge auf dem Server
+  aktiv ist (inkl. Token-Präfix, Ablaufzeit, Request-Anzahl und letzter Nutzung)
+  oder ob noch keine aktiven Sitzungen existieren.
+- **Einladungslink für den Owner:** Button ✉️ *Einladung erstellen* generiert
+  einen 1-Stunde gültigen Einzellink (`max_uses=1, max_age=3600`) und zeigt
+  ihn direkt im Panel an (ehrliche Fehlermeldung bei fehlendem
+  `create_instant_invite`-Recht).
+- **Server verlassen:** Danger-Button 🚪 *Server verlassen* mit zweistufigem
+  Bestätigungsdialog (`guild.leave()`), fängt Fehler ab und kehrt zur
+  aktualisierten Liste zurück.
+- **Zurück-Button:** Bringt dich mit gemerkter Seite und aktivem Suchbegriff
+  zurück in die Listenansicht.
+
+Auch die Panel-Buttons und Selects überleben einen Neustart: Seite, Suchbegriff
+und Server-IDs reisen in den Custom-IDs mit — ein altes Panel bleibt bedienbar.
 
 ### DM-Benachrichtigungen bei Beitritt & Verlassen
 
@@ -741,11 +759,11 @@ sie in allen Clients erscheinen (`/connect` auf bestehenden Servern meist sofort
 ## Tests
 
 ```bash
-python scripts/smoke_test.py          # 274 Prüfungen, ohne Discord-Verbindung
+python scripts/smoke_test.py          # 280 Prüfungen, ohne Discord-Verbindung
 python scripts/smoke_test.py -v       # jede einzelne Prüfung anzeigen
 python scripts/smoke_test.py auth read write   # nur ausgewählte Gruppen
 
-python scripts/login_recovery_test.py # 176 Prüfungen: Login/Rate-Limit + Client-Setup + Owner-Features
+python scripts/login_recovery_test.py # 194 Prüfungen: Login/Rate-Limit + Client-Setup + Owner-Features
 python -m bot.netcheck                # echte Netz-Diagnose (IP + discord.com)
 ```
 
@@ -997,8 +1015,8 @@ AIDiscordServerEinrichten/
 │           ├── events.py    Scheduled Events
 │           └── setup.py     Der Setup-Wizard + sechs Vorlagen
 ├── scripts/
-│   ├── smoke_test.py        274 Prüfungen ohne Discord-Verbindung
-│   ├── login_recovery_test.py 176 Prüfungen: 429/1015 + Client-Setup + Owner-Features
+│   ├── smoke_test.py        280 Prüfungen ohne Discord-Verbindung
+│   ├── login_recovery_test.py 194 Prüfungen: 429/1015 + Client-Setup + Owner-Features
 │   └── _fake_discord.py     Echte discord.py-Subklassen als Test-Double
 ├── deploy/
 │   ├── docker-compose.yml   VPS: Bot + Caddy (HTTPS) aus dem vorhandenen Dockerfile
