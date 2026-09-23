@@ -512,6 +512,53 @@ async def t_session_lifecycle(h: Harness) -> None:
     expiring.expires_at = _now() - timedelta(minutes=5)   # künstlich abgelaufen
     check("Abgelaufenes Token → ungültig", not _token_valid(h.store, expiring_token))
 
+    # ── Inaktivitäts-Stopp: verfügbar, aber 24 h ungenutzt ─────────────────
+    # (eigene Guild, damit die Tokens der anderen Testgruppen in Ruhe bleiben)
+    idle, idle_token = await h.store.create(
+        guild_id=OTHER_GUILD_ID, guild_name="Vergessliche Guild", created_by=USER_ID,
+        created_by_name="Tester", mode="read", ttl_hours=0.0,
+    )
+    idle.last_used_at = _now() - timedelta(hours=25)      # künstlich vergesslich
+    stopped = await h.store.revoke_inactive(timedelta(hours=24))
+    check("24 h ungenutztes Token wird automatisch gestoppt",
+          any(s.id == idle.id for s in stopped), str([s.id for s in stopped]))
+    check("Inaktivitäts-Stopp vermerkt auto:inactivity",
+          idle.revoked_by == "auto:inactivity", str(idle.revoked_by))
+    check("Gestopptes Token ist ungültig", not _token_valid(h.store, idle_token))
+
+    fresh, fresh_token = await h.store.create(
+        guild_id=OTHER_GUILD_ID, guild_name="Vergessliche Guild", created_by=USER_ID,
+        created_by_name="Tester", mode="read", ttl_hours=0.0,
+    )
+    _token_valid(h.store, fresh_token)                    # Nutzung = letzter Kontakt
+    check("Frisch benutztes Token bleibt aktiv", _token_valid(h.store, fresh_token))
+    check("Inaktivitäts-Stopp 0/None = deaktiviert",
+          await h.store.revoke_inactive(timedelta(0)) == []
+          and await h.store.revoke_inactive(None) == [])
+
+    # ── 401er sagen Arena AI, was der Admin vermutlich getan hat ───────────
+    async with _temp_api(h.base, fresh_token) as dying:
+        # Fall: Admin hat (per Button/API) getrennt oder neu generiert
+        await h.store.revoke(session_id=fresh.id, by="button:1")
+        dead = await dying.call("GET", "/api/v1/session")
+        error = dead["json"].get("error", {})
+        check("Getrenntes Token → 401 TOKEN_REVOKED mit Grund",
+              dead["status"] == 401 and error.get("code") == "TOKEN_REVOKED"
+              and "getrennt" in error.get("message", ""), json.dumps(error, ensure_ascii=False)[:200])
+        check("401 nennt schnelle Wiederanbindung (/connect + Verbinden)",
+              "Verbinden" in (error.get("hint") or "") and "connect" in (error.get("hint") or ""))
+
+    async with _temp_api(h.base, "adse_völligUnbekannt") as stranger:
+        unknown = await stranger.call("GET", "/api/v1/session")
+        hint = unknown["json"].get("error", {}).get("hint") or ""
+        check("Unbekanntes Token → 401 TOKEN_INVALID",
+              unknown["status"] == 401
+              and unknown["json"].get("error", {}).get("code") == "TOKEN_INVALID")
+        check("401 listet die wahrscheinlichen Ursachen",
+              all(needle in hint for needle in
+                  ("neues Token generiert", "zurückgesetzt", "24 Stunden")),
+              hint[:200])
+
 
 @contextlib.asynccontextmanager
 async def _temp_api(base: str, token: str):

@@ -57,7 +57,10 @@ import discord  # noqa: E402
 
 from bot import main as botmain  # noqa: E402
 from bot.config import Config, ConfigError, load_config, mask_proxy_url  # noqa: E402
-from bot.discord_bot import RelayClient  # noqa: E402
+from bot.discord_bot import (  # noqa: E402
+    CID_CONNECT, CID_DISCONNECT, CID_REGENERATE, RelayClient,
+    connected_view, welcome_view,
+)
 from bot.netcheck import (  # noqa: E402
     DISCORD_PROBE_URL,
     VERDICT_IP_BLOCKED,
@@ -69,6 +72,11 @@ from bot.netcheck import (  # noqa: E402
 )
 from bot.sessions import SessionStore  # noqa: E402
 from bot.web.app import AppState  # noqa: E402
+
+# Echte discord.py-Subklassen für die Guild-/Member-Doubles (gleiche Datei wie
+# im Smoke-Test — die isinstance()-Prüfungen der Bot-Logik sollen greifen).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _fake_discord import FakeGuild, FakeMember, FakeRole  # noqa: E402
 
 VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
 
@@ -945,13 +953,67 @@ async def test_client_setup() -> None:
     check("setup_hook() wirft nicht", setup_ok, setup_detail)
 
     names = {c.name for c in client.tree.get_commands()}
-    check("drei Slash-Commands registriert",
-          names == {"connect", "status", "revoke"}, str(sorted(names)))
+    check("vier Slash-Commands registriert (inkl. adminpanel)",
+          names == {"connect", "status", "revoke", "adminpanel"}, str(sorted(names)))
     check("genau eine persistente Button-View",
           len(client.persistent_views) == 1, str(len(client.persistent_views)))
     check("Command-Sync wurde aufgerufen", len(sync_calls) == 1)
 
-    # 2) Button-Klicks: Die Buttons aus RelayButtons haben keinen Callback —
+    # 1b) /connect ist optionenlos und antwortet als Container-V2-Nachricht.
+    connect_cmd = client.tree.get_command("connect")
+    check("connect hat keine Command-Optionen mehr",
+          connect_cmd is not None and not connect_cmd._params,
+          str(getattr(connect_cmd, "_params", None)))
+
+    def _flatten(view: Any) -> List[Dict[str, Any]]:
+        flat: List[Dict[str, Any]] = []
+
+        def walk(items: List[Dict[str, Any]]) -> None:
+            for item in items:
+                flat.append(item)
+                walk(item.get("components", []))
+
+        walk(view.to_components())
+        return flat
+
+    def _texts(view: Any) -> str:
+        return "\n".join(p.get("content", "") for p in _flatten(view) if p.get("type") == 10)
+
+    def _buttons(view: Any) -> List[Dict[str, Any]]:
+        return [b for p in _flatten(view) if p.get("type") == 2 for b in [p]]
+
+    welcome = welcome_view()
+    check("Willkommen ist Components V2 (Container)",
+          welcome.has_components_v2() and welcome.to_components()[0]["type"] == 17)
+    check("Willkommen: Titel + 'deaktiviert' + Verbinden-Button",
+          "# Willkommen!" in _texts(welcome) and "deaktiviert" in _texts(welcome)
+          and any(b.get("custom_id") == CID_CONNECT and b.get("style") == 3
+                  for b in _buttons(welcome)))
+
+    linked = connected_view("https://relay.example.com", "adse_UNITTEST")
+    check("Verbunden ist Components V2 (Container)",
+          linked.has_components_v2() and linked.to_components()[0]["type"] == 17)
+    linked_text = _texts(linked)
+    check("Verbunden: Prompt-Block enthält nur Verbindung + Start-Zeile",
+          "URL: https://relay.example.com" in linked_text
+          and "TOKEN: adse_UNITTEST" in linked_text
+          and "/api/v1/capabilities" in linked_text
+          and "REGELN:" not in linked_text, linked_text[:200])
+    linked_codeblocks = re.findall(r"```(.+?)```", linked_text, re.S)
+    check("Verbunden: Prompt ist EIN einzeiliger Codeblock (Mobile-Tap-Copy)",
+          len(linked_codeblocks) == 1 and "\n" not in linked_codeblocks[0]
+          and linked_codeblocks[0]
+          == "URL: https://relay.example.com | TOKEN: adse_UNITTEST",
+          str(linked_codeblocks))
+    check("Verbunden: Arena-Link + roter Trennen + Neues Token",
+          any(b.get("url") == "https://arena.ai" for b in _buttons(linked))
+          and any(b.get("custom_id") == CID_DISCONNECT and b.get("style") == 4
+                  for b in _buttons(linked))
+          and any(b.get("custom_id") == CID_REGENERATE for b in _buttons(linked)))
+    check("Verbunden: unter Discords 4000-Zeichen-Limit",
+          linked.content_length() < 4000, str(linked.content_length()))
+
+    # 2) Button-Klicks: Die registrierten Buttons haben keinen Callback —
     #    sie kommen ausschließlich über das globale on_interaction an.
     hits: List[str] = []
 
@@ -1024,6 +1086,334 @@ async def test_client_setup() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Unit: Owner-Features (Presence, Adminpanel, Join/Leave-DMs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _DmCapture:
+    """Ein User/Member-Double, das DMs (Views) nur einsammelt."""
+
+    def __init__(self, uid: int, name: str) -> None:
+        self.id = uid
+        self.name = name
+        self.mention = f"<@{uid}>"
+        self.sent: List[Any] = []
+
+    async def send(self, *args: Any, view: Any = None, **kwargs: Any) -> Any:
+        self.sent.append(view)
+        return None
+
+
+class _FakeResponse:
+    def __init__(self) -> None:
+        self.deferred = False
+        self.modals: List[Any] = []
+        self.messages: List[Dict[str, Any]] = []
+        self.edits: List[Dict[str, Any]] = []
+        self.followups: List[Dict[str, Any]] = []
+        self.embeds: List[Any] = []
+
+    def is_done(self) -> bool:
+        return self.deferred
+
+    async def defer(self, *args: Any, **kwargs: Any) -> None:
+        self.deferred = True
+
+    async def send_modal(self, modal: Any) -> None:
+        self.deferred = True
+        self.modals.append(modal)
+
+    async def send_message(self, *args: Any, embed: Any = None, view: Any = None,
+                           ephemeral: bool = False, **kwargs: Any) -> None:
+        self.deferred = True
+        self.messages.append({"embed": embed, "view": view, "ephemeral": ephemeral})
+
+    async def edit_message(self, *args: Any, view: Any = None, **kwargs: Any) -> None:
+        self.deferred = True
+        self.edits.append({"view": view})
+
+
+class _FakeFollowup:
+    def __init__(self, response: _FakeResponse) -> None:
+        self._response = response
+        self.sends: List[Dict[str, Any]] = []
+
+    async def send(self, *args: Any, view: Any = None, ephemeral: bool = False,
+                   **kwargs: Any) -> None:
+        self.sends.append({"view": view, "ephemeral": ephemeral})
+
+
+def _panel_interaction(user_id: int, *, guild: Any = None) -> Any:
+    class _It:
+        pass
+    it = _It()
+    it.guild = guild
+    it.user = _DmCapture(user_id, f"User{user_id % 100}")
+    it.response = _FakeResponse()
+    it.followup = _FakeFollowup(it.response)
+    return it
+
+
+def _flatten_view(view: Any) -> List[Dict[str, Any]]:
+    flat: List[Dict[str, Any]] = []
+
+    def walk(items: List[Dict[str, Any]]) -> None:
+        for item in items:
+            flat.append(item)
+            walk(item.get("components", []))
+
+    walk(view.to_components())
+    return flat
+
+
+def _view_text(view: Any) -> str:
+    return "\n".join(p.get("content", "") for p in _flatten_view(view) if p.get("type") == 10)
+
+
+def _view_buttons(view: Any) -> List[Dict[str, Any]]:
+    return [p for p in _flatten_view(view) if p.get("type") == 2]
+
+
+async def test_owner_features() -> None:
+    print("\n── Unit: Owner-Features (Presence / Adminpanel / DMs) ───────")
+    cfg = load_config()
+    store = SessionStore(path=None, persist=False)
+    client = RelayClient(cfg, store, state=None)
+    client.state = AppState(client=client, config=cfg, store=store)
+    client.tree.sync = (lambda guild=None: _async_iter([]))  # type: ignore[method-assign]
+
+    # ── Presence: Live-Zähler + Singular/Plural ────────────────────────────
+    check("Presence: 0 Server (Plural)",
+          client._presence_text() == "/connect | 👀 0 eingerichtete Server",
+          client._presence_text())
+    g_small = FakeGuild(gid=901, name="Klein"); g_small.member_count = 5
+    g_big = FakeGuild(gid=902, name="Gross");   g_big.member_count = 900
+    client._connection._guilds = {g.id: g for g in (g_small, g_big)}
+    check("Presence: 2 Server (Plural)",
+          client._presence_text() == "/connect | 👀 2 eingerichtete Server",
+          client._presence_text())
+    client._connection._guilds = {g_small.id: g_small}
+    check("Presence: 1 Server (Singular 'eingerichteter')",
+          client._presence_text() == "/connect | 👀 1 eingerichteter Server",
+          client._presence_text())
+
+    presence_calls: List[Any] = []
+
+    async def fake_change_presence(*, activity: Any = None, status: Any = None) -> None:
+        presence_calls.append(activity.name if activity else None)
+
+    client.change_presence = fake_change_presence  # type: ignore[method-assign]
+
+    # ── Join: Presence + DM an Bot-Owner + Willkommens-DM an Server-Owner ──
+    bot_owner_dm = _DmCapture(cfg.bot_owner_id, "BotOwner")
+    client.get_user = lambda uid: bot_owner_dm if uid == cfg.bot_owner_id else None  # type: ignore[method-assign]
+
+    join_guild = FakeGuild(gid=903, name="Join Server"); join_guild.member_count = 777
+    server_owner_dm = _DmCapture(join_guild.owner_id, "ServerOwner")
+    join_guild.owner.send = server_owner_dm.send  # type: ignore[method-assign]
+
+    # Der Gateway-Layer hätte die Guild schon im Cache — hier von Hand.
+    client._connection._guilds[join_guild.id] = join_guild
+    await client.on_guild_join(join_guild)
+    await asyncio.sleep(0)
+    check("Join aktualisiert die Presence", presence_calls == ["/connect | 👀 2 eingerichtete Server"],
+          str(presence_calls))
+
+    check("Join-DM an den Bot-Owner ging raus", len(bot_owner_dm.sent) == 1,
+          str(len(bot_owner_dm.sent)))
+    join_dm_text = _view_text(bot_owner_dm.sent[0]) if bot_owner_dm.sent else ""
+    check("Join-DM: Components V2 + Servername + Mitglieder + Owner-Mention",
+          bot_owner_dm.sent and bot_owner_dm.sent[0].has_components_v2()
+          and "Server beigetreten: Join Server" in join_dm_text
+          and "777" in join_dm_text
+          and f"<@{join_guild.owner_id}>" in join_dm_text,
+          join_dm_text[:200])
+
+    check("Willkommens-DM an den Server-Owner ging raus", len(server_owner_dm.sent) == 1,
+          str(len(server_owner_dm.sent)))
+    welcome_text = _view_text(server_owner_dm.sent[0]) if server_owner_dm.sent else ""
+    check("Willkommens-DM: Server fett + /connect als Inline-Codebox + Verbinden",
+          server_owner_dm.sent
+          and "**Join Server**" in welcome_text
+          and "`/connect`" in welcome_text
+          and "Verbinden" in welcome_text,
+          welcome_text[:200])
+    check("Willkommens-DM: Container-Layout (V2)",
+          server_owner_dm.sent and server_owner_dm.sent[0].has_components_v2())
+
+    # ── Leave: Presence + DM mit Grund (Audit-Log-Fund und ehrlicher Fallback) ──
+    client._connection.user = _DmCapture(222222222222222222, "BotSelf")
+    del client._connection._guilds[join_guild.id]
+
+    class _KickEntry:
+        def __init__(self) -> None:
+            self.action = discord.AuditLogAction.kick
+            self.reason = "Ungepflegter Bot"
+            self.target = _DmCapture(222222222222222222, "BotSelf")
+            self.user = _DmCapture(999, "Moderator")
+
+    class _AuditGuild(FakeGuild):
+        def audit_logs(self, **kwargs: Any):  # noqa: ANN201
+            async def _gen():
+                yield _KickEntry()
+                yield object()  # unabhängiger Eintrag, wird übersprungen
+            return _gen()
+
+    audit_guild = _AuditGuild(gid=904, name="Audit Server"); audit_guild.member_count = 42
+    server_owner_dm2 = _DmCapture(audit_guild.owner_id, "ServerOwner2")
+    audit_guild.owner.send = server_owner_dm2.send  # type: ignore[method-assign]
+    bot_owner_dm.sent.clear()
+    await client.on_guild_remove(audit_guild)
+    check("Leave aktualisiert die Presence erneut", len(presence_calls) == 2
+          and presence_calls[1] == "/connect | 👀 1 eingerichteter Server",
+          str(presence_calls))
+    check("Leave-DM an den Bot-Owner ging raus", len(bot_owner_dm.sent) == 1,
+          str(len(bot_owner_dm.sent)))
+    leave_text = _view_text(bot_owner_dm.sent[0]) if bot_owner_dm.sent else ""
+    check("Leave-DM: Servername + Grund aus dem Audit-Log",
+          "Server verlassen: Audit Server" in leave_text and "gekickt" in leave_text
+          and "Ungepflegter Bot" in leave_text,
+          leave_text[:200])
+
+    # Ohne Audit-Log-Fund: ehrlicher Fallback statt erfundenem Grund.
+    fallback_guild = FakeGuild(gid=905, name="Fallback Server")
+    bot_owner_dm.sent.clear()
+    await client.on_guild_remove(fallback_guild)
+    leave_fallback = _view_text(bot_owner_dm.sent[0]) if bot_owner_dm.sent else ""
+    check("Leave-DM ohne Audit-Zugriff: ehrlicher Fallback-Grund",
+          "nicht ermittelbar" in leave_fallback and "Audit-Log" in leave_fallback,
+          leave_fallback[:200])
+
+    # ── Adminpanel: Command-Guards (DM-only + Owner-only) ──────────────────
+    await client._async_setup_hook()   # Loop & Interna (macht sonst login())
+    await client.setup_hook()          # Commands + persistente View
+    panel_cmd = client.tree.get_command("adminpanel")
+    check("adminpanel-Command ist registriert", panel_cmd is not None)
+
+    guild_it = _panel_interaction(cfg.bot_owner_id, guild=g_small)
+    await panel_cmd._do_call(guild_it, {})  # type: ignore[arg-type]
+    check("adminpanel im Server-Channel → Abweisung 'Nur im Privatchat'",
+          len(guild_it.response.messages) == 1
+          and guild_it.response.messages[0]["embed"] is not None
+          and "Privatchat" in getattr(guild_it.response.messages[0]["embed"], "title", ""),
+          str([getattr(m["embed"], "title", "") for m in guild_it.response.messages]))
+
+    stranger_it = _panel_interaction(123456789)  # DM, aber nicht der Owner
+    await panel_cmd._do_call(stranger_it, {})  # type: ignore[arg-type]
+    check("adminpanel von Fremden → Abweisung 'Nur für den Bot-Owner'",
+          len(stranger_it.response.messages) == 1
+          and "Bot-Owner" in getattr(stranger_it.response.messages[0]["embed"], "title", ""),
+          str([getattr(m["embed"], "title", "") for m in stranger_it.response.messages]))
+
+    # Owner im Privatchat: Panel mit sortierter Liste.
+    guilds = []
+    for i, (name, count, owner_in) in enumerate(
+        [("Zeta", 100, True), ("Alpha", 900, False), ("Mid", 300, True), ("Tiny", 2, False)]
+    ):
+        g = FakeGuild(gid=1000 + i, name=name)
+        g.member_count = count
+        guilds.append(g)
+        if owner_in:
+            admin_role = FakeRole(5000 + i, "Admin", 9, discord.Permissions(administrator=True).value)
+            g.members.append(FakeMember(cfg.bot_owner_id, "Owner", [g.default_role, admin_role], guild=g))
+    client._connection._guilds = {g.id: g for g in guilds}
+    owner_it = _panel_interaction(cfg.bot_owner_id)
+    await panel_cmd._do_call(owner_it, {})  # type: ignore[arg-type]
+    check("adminpanel: Owner bekommt followup (nach defer)", len(owner_it.followup.sends) == 1,
+          str(len(owner_it.followup.sends)))
+    panel = owner_it.followup.sends[0]["view"] if owner_it.followup.sends else None
+    panel_text = _view_text(panel) if panel is not None else ""
+    check("Panel ist Container V2", panel is not None and panel.has_components_v2())
+    check("Panel: ❗️-Server (Owner fehlt) stehen ganz oben — nach Mitgliedern sortiert",
+          panel_text.find("❗️ **Alpha**") < panel_text.find("❗️ **Tiny**")
+          < panel_text.find("**Mid**") < panel_text.find("**Zeta**"),
+          panel_text[:300])
+    check("Panel: deutsche Zahlenformate (900 statt 900)", "900" in panel_text.replace(".", ""),
+          panel_text[:100])
+    check("Panel: Seiten-Fußzeile", "Seite 1/1" in panel_text and "4 Server gesamt" in panel_text,
+          panel_text[:100])
+
+    # Blättern: nav-Button über on_interaction (wie nach einem Neustart).
+    async def fake_show(interaction: Any, view: Any) -> None:
+        interaction.response.edits.append({"view": view})
+
+    client._show = fake_show  # type: ignore[method-assign]
+    nav_it = _panel_interaction(cfg.bot_owner_id)
+    nav_it.data = {"custom_id": "relay:admin:nav:0:"}
+    nav_it.type = discord.InteractionType.component
+    client.dispatch("interaction", nav_it)
+    await asyncio.sleep(0.05)
+    check("nav-Button bearbeitet das Panel (via on_interaction)",
+          len(nav_it.response.edits) == 1, str(len(nav_it.response.edits)))
+
+    # Suche-Button öffnet das Modal.
+    search_it = _panel_interaction(cfg.bot_owner_id)
+    search_it.data = {"custom_id": "relay:admin:search"}
+    search_it.type = discord.InteractionType.component
+    client.dispatch("interaction", search_it)
+    await asyncio.sleep(0.05)
+    check("Suche-Button öffnet das Suchfenster (Modal)",
+          len(search_it.response.modals) == 1
+          and search_it.response.modals[0].title == "🔍 Server suchen",
+          str([getattr(m, "title", "?") for m in search_it.response.modals]))
+
+    # Modal-Submit: Filter greift, Liste startet bei Seite 1.
+    modal = search_it.response.modals[0]
+    modal.query._value = "Zeta"  # setValue geht nur über den Refresh-Pfad
+    submit_it = _panel_interaction(cfg.bot_owner_id)
+    await modal.on_submit(submit_it)
+    check("Modal-Submit antwortet mit gefiltertem Panel",
+          len(submit_it.response.messages) == 1, str(len(submit_it.response.messages)))
+    result_text = _view_text(submit_it.response.messages[0]["view"]) if submit_it.response.messages else ""
+    check("Gefiltertes Panel zeigt nur den Treffer",
+          "**Zeta**" in result_text and "**Alpha**" not in result_text
+          and "Suche: „Zeta“" in result_text,
+          result_text[:200])
+
+    # Custom-ID-Roundtrip + Grenzen.
+    from bot.discord_bot import _admin_custom_id, _parse_admin_custom_id
+    parsed = _parse_admin_custom_id(_admin_custom_id("nav", 3, "Gaming"))
+    check("Admin-Custom-ID: Seite + Suche überleben den Roundtrip",
+          parsed == {"action": "nav", "page": 3, "query": "Gaming"}, str(parsed))
+    check("Admin-Custom-ID bleibt unter Discords 100-Zeichen-Limit",
+          len(_admin_custom_id("nav", 999, "x" * 40)) <= 100,
+          str(len(_admin_custom_id("nav", 999, "x" * 40))))
+
+    # Kein Owner konfiguriert → gar nichts tun (kein Crash, keine DM).
+    cfg_no_owner = Config(discord_token="x", bot_owner_id=0)
+    client2 = RelayClient(cfg_no_owner, SessionStore(path=None, persist=False), state=None)
+    client2.state = AppState(client=client2, config=cfg_no_owner,
+                             store=SessionStore(path=None, persist=False))
+    noowner_guild = FakeGuild(gid=906, name="NoOwner")
+    nobody = _DmCapture(1, "nobody")
+    noowner_guild.owner.send = nobody.send  # type: ignore[method-assign]
+    noowner_calls: List[Any] = []
+
+    async def fake_change_presence2(*, activity: Any = None, status: Any = None) -> None:
+        noowner_calls.append(activity.name if activity else None)
+
+    client2.change_presence = fake_change_presence2  # type: ignore[method-assign]
+    await client2.on_guild_join(noowner_guild)
+    await client2.on_guild_remove(noowner_guild)
+    # BOT_OWNER_ID=0 schaltet nur die Bot-Owner-Features aus — die Willkommens-DM
+    # an den SERVER-Owner ist ein Kern-Feature und geht trotzdem raus.
+    check("BOT_OWNER_ID=0: Willkommens-DM geht trotzdem raus", len(nobody.sent) == 1,
+          str(len(nobody.sent)))
+    check("BOT_OWNER_ID=0: keine Owner-Benachrichtigungen (Join UND Leave)",
+          len(nobody.sent) == 1 and "Hey! 👋" in _view_text(nobody.sent[0]),
+          _view_text(nobody.sent[0])[:80] if nobody.sent else "")
+
+    await client.close()
+    await client2.close()
+
+
+def _async_iter(items: List[Any]) -> Any:
+    async def _coro() -> List[Any]:
+        return items
+    return _coro()
+
+
 async def arun() -> int:
     print("🔁 Test der Login-Wiederherstellung (Cloudflare 429 / Error 1015)")
     test_detection_units()
@@ -1031,6 +1421,7 @@ async def arun() -> int:
     test_config_units()
     test_state_units()
     await test_client_setup()
+    await test_owner_features()
     test_ledger_units()
     test_egress_tracking_units()
     await test_ip_ban_lifts()

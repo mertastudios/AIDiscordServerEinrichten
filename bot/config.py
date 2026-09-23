@@ -90,8 +90,17 @@ class Config:
     discord_token: str
     bot_name: str = "AIDiscordServerEinrichten"
     command_name: str = "connect"
-    activity_text: str = "/connect · KI-Steuerung für deinen Server"
     status_presence: str = "online"
+    bot_owner_id: int = 1414615828342509628
+    """
+    Discord-User-ID des Bot-Besitzers (``BOT_OWNER_ID``).
+
+    Sie schaltet die Owner-Features frei: das Adminpanel ``/adminpanel`` im
+    Privatchat (durchsuchbare, blätterbare Server-Liste) sowie DMs bei jedem
+    Server-Beitritt und -Verlassen. Die Presence zeigt zusätzlich live, auf
+    wie vielen Servern der Bot ist — das braucht keine eigene Variable.
+    ``0`` deaktiviert beides.
+    """
 
     # ── Web-Server ─────────────────────────────────────────────────────────
     host: str = "0.0.0.0"
@@ -105,6 +114,19 @@ class Config:
     max_sessions_per_guild: int = 5
     data_dir: str = "data"
     persist_sessions: bool = True
+    session_inactivity_hours: float = 24.0
+    """
+    Inaktivitäts-Stopp: Wird ein Sitzungs-Token so lange nicht benutzt (kein
+    einziger API-Aufruf von Arena AI), stoppt die Bridge die Verbindung
+    automatisch. Ein verfügbares, aber ungenutztes Token ist ein unnötig
+    offenes Tor — „24 Stunden verfügbar, aber 24 Stunden lang hat es niemand
+    benutzt“ reicht als Grund fürs Trennen.
+
+    Gezählt wird ab der letzten Nutzung (oder dem Erstellen, wenn das Token
+    nie benutzt wurde). ``0`` deaktiviert den Inaktivitäts-Stopp; die normale
+    Gültigkeit (``SESSION_TTL_HOURS``) läuft davon unberührt weiter.
+    Prüft der Housekeeping-Loop alle ~15 Sekunden.
+    """
 
     # ── Sicherheit / Limits ────────────────────────────────────────────────
     api_rate_limit: int = 240     # Anfragen pro Token ...
@@ -308,8 +330,8 @@ def load_config() -> Config:
         discord_token=token,
         bot_name=_str("BOT_NAME", "AIDiscordServerEinrichten"),
         command_name=_str("COMMAND_NAME", "connect").lstrip("/").lower()[:32] or "connect",
-        activity_text=_str("ACTIVITY_TEXT", "/connect · KI-Steuerung für deinen Server"),
         status_presence=_str("PRESENCE_STATUS", "online").lower(),
+        bot_owner_id=_int("BOT_OWNER_ID", 1414615828342509628),
         host=_str("HOST", "0.0.0.0"),
         port=_int("PORT", 8080),
         base_url=_clean_url(_str("PUBLIC_URL", "")),
@@ -319,6 +341,7 @@ def load_config() -> Config:
         max_sessions_per_guild=_int("MAX_SESSIONS_PER_GUILD", 5),
         data_dir=_str("DATA_DIR", "data"),
         persist_sessions=_bool("PERSIST_SESSIONS", True),
+        session_inactivity_hours=_float("SESSION_INACTIVITY_HOURS", 24.0),
         api_rate_limit=_int("API_RATE_LIMIT", 240),
         api_rate_window=_int("API_RATE_WINDOW", 60),
         max_body_bytes=_int("MAX_BODY_BYTES", 8 * 1024 * 1024),
@@ -345,8 +368,16 @@ def load_config() -> Config:
         discord_proxy_password=_str("DISCORD_PROXY_PASSWORD", ""),
     )
 
+    if cfg.bot_owner_id < 0:
+        raise ConfigError("BOT_OWNER_ID darf nicht negativ sein (0 = Owner-Features aus).")
     if cfg.session_ttl_hours < 0:
         raise ConfigError("SESSION_TTL_HOURS darf nicht negativ sein (0 = unbegrenzt).")
+    if cfg.session_inactivity_hours < 0:
+        raise ConfigError(
+            "SESSION_INACTIVITY_HOURS darf nicht negativ sein (0 = Inaktivitäts-Stopp aus)."
+        )
+    if cfg.session_inactivity_hours > 24 * 366:
+        raise ConfigError("SESSION_INACTIVITY_HOURS darf höchstens 8784 (ein Jahr) sein.")
     if cfg.max_sessions_per_guild < 1:
         raise ConfigError("MAX_SESSIONS_PER_GUILD muss mindestens 1 sein.")
     if not 0.0 <= cfg.settle_scale <= 10.0:
