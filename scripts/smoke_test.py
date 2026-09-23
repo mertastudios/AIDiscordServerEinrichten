@@ -866,6 +866,36 @@ async def t_prompt(h: Harness) -> None:
         page=0, query="",
     )
     check("admin_guild_detail_view ist Components V2", detail_v.has_components_v2())
+
+    # Regression: Discord akzeptiert als Section-Accessory NUR Button/Thumbnail.
+    # Früher baute die Kopfzeile bei Servern OHNE Icon ein TextDisplay-Accessory
+    # → Discord lehnte die Detailansicht/Owner-DMs mit 400 ab
+    # („Die Anwendung reagiert nicht" im Client).
+    def bad_section_accessories(view: Any) -> List[Any]:
+        bad: List[Any] = []
+        flat: List[Dict[str, Any]] = []
+
+        def walk(items: List[Dict[str, Any]]) -> None:
+            for item in items:
+                flat.append(item)
+                walk(item.get("components", []))
+
+        walk(view.to_components())
+        for part in flat:
+            if part.get("type") == 9:
+                accessory = part.get("accessory") or {}
+                if accessory.get("type") not in (2, 11):
+                    bad.append(accessory.get("type"))
+        return bad
+
+    check("admin_guild_detail_view (ohne Icon): kein ungültiges Section-Accessory",
+          bad_section_accessories(detail_v) == [],
+          str(bad_section_accessories(detail_v)))
+    from bot.discord_bot import guild_join_notify_view, guild_remove_notify_view
+    check("Join-/Leave-DM (ohne Icon): kein ungültiges Section-Accessory",
+          bad_section_accessories(guild_join_notify_view(g_smoke, None)) == []
+          and bad_section_accessories(guild_remove_notify_view(g_smoke, None, "grund")) == [],
+          "Section-Accessory muss Button/Thumbnail sein")
     leave_v = admin_guild_leave_confirm_view(g_smoke, page=0, query="")
     check("admin_guild_leave_confirm_view ist Components V2", leave_v.has_components_v2())
 

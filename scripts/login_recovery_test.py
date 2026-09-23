@@ -1182,6 +1182,23 @@ def _view_buttons(view: Any) -> List[Dict[str, Any]]:
     return [p for p in _flatten_view(view) if p.get("type") == 2]
 
 
+def _bad_section_accessories(view: Any) -> List[Any]:
+    """
+    Discord lässt als Section-Accessory NUR Button (2) oder Thumbnail (11) zu —
+    ein TextDisplay-Accessory macht die komplette Nachricht ungültig
+    (400 Invalid Form Body → „Die Anwendung reagiert nicht"). Das war der Bug
+    hinter dem toten Adminpanel: Server ohne Icon bekamen genau diesen
+    Fallback und gingen bei JEDER Detailansicht schief.
+    """
+    bad: List[Any] = []
+    for part in _flatten_view(view):
+        if part.get("type") == 9:  # Section
+            accessory = part.get("accessory") or {}
+            if accessory.get("type") not in (2, 11):
+                bad.append(accessory.get("type"))
+    return bad
+
+
 async def test_owner_features() -> None:
     print("\n── Unit: Owner-Features (Presence / Adminpanel / DMs) ───────")
     cfg = load_config()
@@ -1236,6 +1253,9 @@ async def test_owner_features() -> None:
           and "777" in join_dm_text
           and f"<@{join_guild.owner_id}>" in join_dm_text,
           join_dm_text[:200])
+    check("Join-DM (ohne Icon) hat kein ungültiges Section-Accessory",
+          bot_owner_dm.sent and _bad_section_accessories(bot_owner_dm.sent[0]) == [],
+          "Section-Accessory muss Button/Thumbnail sein — sonst 400 von Discord")
 
     check("Willkommens-DM an den Server-Owner ging raus", len(server_owner_dm.sent) == 1,
           str(len(server_owner_dm.sent)))
@@ -1282,6 +1302,9 @@ async def test_owner_features() -> None:
           "Server verlassen: Audit Server" in leave_text and "gekickt" in leave_text
           and "Ungepflegter Bot" in leave_text,
           leave_text[:200])
+    check("Leave-DM (ohne Icon) hat kein ungültiges Section-Accessory",
+          bot_owner_dm.sent and _bad_section_accessories(bot_owner_dm.sent[0]) == [],
+          "Section-Accessory muss Button/Thumbnail sein — sonst 400 von Discord")
 
     # Ohne Audit-Log-Fund: ehrlicher Fallback statt erfundenem Grund.
     fallback_guild = FakeGuild(gid=905, name="Fallback Server")
@@ -1418,6 +1441,9 @@ async def test_owner_features() -> None:
     detail_view = select_it.response.edits[0]["view"] if select_it.response.edits else None
     detail_text = _view_text(detail_view) if detail_view else ""
     check("Server-Übersicht ist Container V2", detail_view is not None and detail_view.has_components_v2())
+    check("Server-Übersicht (ohne Icon) hat kein ungültiges Section-Accessory",
+          detail_view is not None and _bad_section_accessories(detail_view) == [],
+          "Section-Accessory muss Button/Thumbnail sein — sonst 400 → 'reagiert nicht'")
     check("Server-Übersicht: Servername, ID, Mitglieder, Status",
           "Zeta" in detail_text and "1000" in detail_text and "100" in detail_text
           and "Du bist Mitglied" in detail_text, detail_text[:200])
