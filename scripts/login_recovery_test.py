@@ -994,19 +994,17 @@ async def test_client_setup() -> None:
     check("Verbunden ist Components V2 (Container)",
           linked.has_components_v2() and linked.to_components()[0]["type"] == 17)
     linked_text = _texts(linked)
-    check("Verbunden: Prompt-Block enthält nur Verbindung + Start-Zeile",
+    check("Verbunden: Prompt-Block enthält nur Verbindung",
           "URL: https://relay.example.com" in linked_text
           and "TOKEN: adse_UNITTEST" in linked_text
-          and "/api/v1/capabilities" in linked_text
-          and "REGELN:" not in linked_text, linked_text[:200])
-    linked_codeblocks = re.findall(r"```(.+?)```", linked_text, re.S)
+          and "REGELN:" not in linked_text
+          and "/api/v1/capabilities" not in linked_text, linked_text[:200])
+    linked_codeblocks = re.findall(r"`([^`\n]+)`", linked_text)
     check("Verbunden: Prompt ist EIN einzeiliger Codeblock (Mobile-Tap-Copy)",
-          len(linked_codeblocks) == 1 and "\n" not in linked_codeblocks[0]
-          and linked_codeblocks[0]
-          == "URL: https://relay.example.com | TOKEN: adse_UNITTEST",
+          any(cb == "URL: https://relay.example.com | TOKEN: adse_UNITTEST" for cb in linked_codeblocks),
           str(linked_codeblocks))
     check("Verbunden: Arena-Link + roter Trennen + Neues Token",
-          any(b.get("url") == "https://arena.ai" for b in _buttons(linked))
+          any(b.get("url") == "https://arena.ai/agent" for b in _buttons(linked))
           and any(b.get("custom_id") == CID_DISCONNECT and b.get("style") == 4
                   for b in _buttons(linked))
           and any(b.get("custom_id") == CID_REGENERATE for b in _buttons(linked)))
@@ -1371,14 +1369,113 @@ async def test_owner_features() -> None:
           and "Suche: „Zeta“" in result_text,
           result_text[:200])
 
+    # Gefiltertes Panel zeigt Treffer.
+    check("Gefiltertes Panel zeigt nur den Treffer",
+          "**Zeta**" in result_text and "**Alpha**" not in result_text
+          and "Suche: „Zeta“" in result_text,
+          result_text[:200])
+
+    # ── Dropdown-Serverauswahl & Serverdetailansicht ─────────────────────────
+    panel_selects = [p for p in _flatten_view(panel) if p.get("type") == 3]
+    check("Panel: Dropdown mit Servern der aktuellen Seite vorhanden",
+          len(panel_selects) == 1 and len(panel_selects[0].get("options", [])) == 4,
+          str(len(panel_selects)))
+
+    # Dropdown-Auswahl -> Server-Übersicht (Detailansicht):
+    select_it = _panel_interaction(cfg.bot_owner_id)
+    select_it.data = {"custom_id": "relay:admin:select:0:", "values": ["1000"]}  # Zeta
+    select_it.type = discord.InteractionType.component
+    client.dispatch("interaction", select_it)
+    await asyncio.sleep(0.05)
+    check("Dropdown-Auswahl öffnet Server-Übersicht (via on_interaction)",
+          len(select_it.response.edits) == 1, str(len(select_it.response.edits)))
+    detail_view = select_it.response.edits[0]["view"] if select_it.response.edits else None
+    detail_text = _view_text(detail_view) if detail_view else ""
+    check("Server-Übersicht ist Container V2", detail_view is not None and detail_view.has_components_v2())
+    check("Server-Übersicht: Servername, ID, Mitglieder, Status",
+          "Zeta" in detail_text and "1000" in detail_text and "100" in detail_text
+          and "Du bist Mitglied" in detail_text, detail_text[:200])
+    check("Server-Übersicht: inaktive KI-Verbindung",
+          "Keine aktiven Tokens" in detail_text or "nicht verbunden" in detail_text,
+          detail_text[:300])
+    detail_btn_labels = [b.get("label") for b in _view_buttons(detail_view)] if detail_view else []
+    check("Server-Übersicht: Buttons 'Zurück', 'Einladung erstellen', 'Server verlassen'",
+          "Zurück" in detail_btn_labels and "Einladung erstellen" in detail_btn_labels
+          and "Server verlassen" in detail_btn_labels, str(detail_btn_labels))
+
+    # Server-Übersicht mit aktiver Sitzung:
+    sess, token = await store.create(
+        guild_id=1000, guild_name="Zeta", created_by=cfg.bot_owner_id,
+        created_by_name="Owner", mode="rw", ttl_hours=24,
+    )
+    select_it_active = _panel_interaction(cfg.bot_owner_id)
+    select_it_active.data = {"custom_id": "relay:admin:select:0:", "values": ["1000"]}
+    select_it_active.type = discord.InteractionType.component
+    client.dispatch("interaction", select_it_active)
+    await asyncio.sleep(0.05)
+    detail_active_text = _view_text(select_it_active.response.edits[0]["view"]) if select_it_active.response.edits else ""
+    check("Server-Übersicht zeigt aktive Verbindung mit Token-Präfix & Ablauf",
+          "Aktive KI-Verbindung" in detail_active_text and sess.token_prefix in detail_active_text
+          and "Requests" in detail_active_text, detail_active_text[:300])
+
+    # Einladung erstellen:
+    invite_it = _panel_interaction(cfg.bot_owner_id)
+    invite_it.data = {"custom_id": "relay:admin:invite:1000:0:"}
+    invite_it.type = discord.InteractionType.component
+    client.dispatch("interaction", invite_it)
+    await asyncio.sleep(0.05)
+    check("Einladung erstellen generiert Invite-URL im Panel",
+          len(invite_it.response.edits) == 1, str(len(invite_it.response.edits)))
+    invite_panel_text = _view_text(invite_it.response.edits[0]["view"]) if invite_it.response.edits else ""
+    check("Invite-URL wird im Panel angezeigt",
+          "discord.gg" in invite_panel_text and "Einladungslink" in invite_panel_text,
+          invite_panel_text[:300])
+
+    # Server verlassen: Schritt 1 - Bestätigungsansicht
+    leave_ask_it = _panel_interaction(cfg.bot_owner_id)
+    leave_ask_it.data = {"custom_id": "relay:admin:leave:1000:0:"}
+    leave_ask_it.type = discord.InteractionType.component
+    client.dispatch("interaction", leave_ask_it)
+    await asyncio.sleep(0.05)
+    check("Server verlassen öffnet Bestätigungsdialog (Confirm-Schritt)",
+          len(leave_ask_it.response.edits) == 1, str(len(leave_ask_it.response.edits)))
+    confirm_view = leave_ask_it.response.edits[0]["view"] if leave_ask_it.response.edits else None
+    confirm_text = _view_text(confirm_view) if confirm_view else ""
+    check("Bestätigungsansicht fragt nach",
+          "Server wirklich verlassen" in confirm_text and "Zeta" in confirm_text, confirm_text[:200])
+
+    # Server verlassen: Schritt 2 - Ausführen (Confirm)
+    leave_confirm_it = _panel_interaction(cfg.bot_owner_id)
+    leave_confirm_it.data = {"custom_id": "relay:admin:leave_confirm:1000:0:"}
+    leave_confirm_it.type = discord.InteractionType.component
+    client.dispatch("interaction", leave_confirm_it)
+    await asyncio.sleep(0.05)
+    check("Server verlassen führt guild.leave() aus und aktualisiert Liste",
+          len(leave_confirm_it.response.edits) == 1, str(len(leave_confirm_it.response.edits)))
+    after_leave_text = _view_text(leave_confirm_it.response.edits[0]["view"]) if leave_confirm_it.response.edits else ""
+    check("Verlassener Server ist nicht mehr in der Liste",
+          "**Zeta**" not in after_leave_text and "3 Server gesamt" in after_leave_text,
+          after_leave_text[:300])
+    check("FakeGuild hat leave-Mutation protokolliert",
+          "guild.leave" in guilds[0].mutations, str(guilds[0].mutations))
+
     # Custom-ID-Roundtrip + Grenzen.
-    from bot.discord_bot import _admin_custom_id, _parse_admin_custom_id
+    from bot.discord_bot import _admin_custom_id, _admin_guild_custom_id, _parse_admin_custom_id
     parsed = _parse_admin_custom_id(_admin_custom_id("nav", 3, "Gaming"))
     check("Admin-Custom-ID: Seite + Suche überleben den Roundtrip",
           parsed == {"action": "nav", "page": 3, "query": "Gaming"}, str(parsed))
+    parsed_guild = _parse_admin_custom_id(_admin_guild_custom_id("guild", 1000, 2, "Test"))
+    check("Admin-Custom-ID: Guild-ID + Seite + Suche überleben den Roundtrip",
+          parsed_guild == {"action": "guild", "guild_id": 1000, "page": 2, "query": "Test"}, str(parsed_guild))
+    parsed_invite = _parse_admin_custom_id(_admin_guild_custom_id("invite", 1000, 0, ""))
+    check("Admin-Custom-ID: Invite-Aktion überlebt den Roundtrip",
+          parsed_invite == {"action": "invite", "guild_id": 1000, "page": 0, "query": ""}, str(parsed_invite))
+    parsed_leave = _parse_admin_custom_id(_admin_guild_custom_id("leave_confirm", 1000, 1, "abc"))
+    check("Admin-Custom-ID: LeaveConfirm-Aktion überlebt den Roundtrip",
+          parsed_leave == {"action": "leave_confirm", "guild_id": 1000, "page": 1, "query": "abc"}, str(parsed_leave))
     check("Admin-Custom-ID bleibt unter Discords 100-Zeichen-Limit",
-          len(_admin_custom_id("nav", 999, "x" * 40)) <= 100,
-          str(len(_admin_custom_id("nav", 999, "x" * 40))))
+          len(_admin_guild_custom_id("leave_confirm", 9876543210123456789, 999, "x" * 40)) <= 100,
+          str(len(_admin_guild_custom_id("leave_confirm", 9876543210123456789, 999, "x" * 40))))
 
     # Kein Owner konfiguriert → gar nichts tun (kein Crash, keine DM).
     cfg_no_owner = Config(discord_token="x", bot_owner_id=0)
