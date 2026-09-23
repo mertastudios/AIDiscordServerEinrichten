@@ -861,6 +861,43 @@ async def t_prompt(h: Harness) -> None:
         page=0, query="", total_guilds=1,
     )
     check("admin_panel_view ist Components V2", panel_v.has_components_v2())
+
+    # Regression: Discord lehnt Variation-Selector-16 (U+FE0F) in
+    # SelectOption.emoji mit 400 "Invalid emoji" ab (Buttons vertragen das
+    # Zeichen klaglos - die Inkonsistenz ist eine bekannte Discord-API-
+    # Eigenheit). Das war der Grund dafuer, dass /adminpanel in Produktion
+    # mit "Die Anwendung reagiert nicht" endete, sobald mindestens ein
+    # Server ohne Bot-Owner-Mitgliedschaft (❗️-Marker) in der Liste stand -
+    # exakt bestaetigt durch den Render-Log-Fehler
+    # ``options.0.emoji.name: Invalid emoji``.
+    def select_option_emoji_names(view: Any) -> List[str]:
+        names: List[str] = []
+        flat: List[Dict[str, Any]] = []
+
+        def walk(items: List[Dict[str, Any]]) -> None:
+            for item in items:
+                flat.append(item)
+                walk(item.get("components", []))
+
+        walk(view.to_components())
+        for part in flat:
+            if part.get("type") == 3:  # Select-Menue
+                for option in part.get("options", []):
+                    emoji = option.get("emoji") or {}
+                    name = emoji.get("name")
+                    if name:
+                        names.append(name)
+        return names
+
+    g_no_owner = FakeGuild(gid=8888, name="KeinOwnerServer")
+    panel_no_owner = admin_panel_view(
+        [{"guild": g_no_owner, "member_count": 5, "owner_present": False}],
+        page=0, query="", total_guilds=1,
+    )
+    emoji_names = select_option_emoji_names(panel_no_owner)
+    check("admin_panel_view (❗️-Server): Select-Option-Emoji ohne Variation-Selector",
+          bool(emoji_names) and all("\ufe0f" not in n and "\ufe0e" not in n for n in emoji_names),
+          str([n.encode("unicode_escape") for n in emoji_names]))
     detail_v = admin_guild_detail_view(
         g_smoke, owner=g_smoke.owner, owner_present=True, sessions=[],
         page=0, query="",

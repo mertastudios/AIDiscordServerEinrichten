@@ -47,7 +47,9 @@ erhält beim Beitritt eine Willkommens-DM mit der Kurzanleitung.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -146,6 +148,29 @@ def _bridge_prompt_line(base_url: str, token: str) -> str:
     liefert Konventionen und Endpoints, dazu die ``/api/v1/guides/*``-Texte.
     """
     return f"URL={base_url};TOKEN={token}"
+
+
+#: Variation Selector-16 (U+FE0F) erzwingt die *emoji-Darstellung* eines
+#: Zeichens (statt Text) und ist Teil vieler „richtiger“ Emoji-Strings, die
+#: Editoren/Copy-Paste einfügen (z. B. ``❗️`` = U+2757 + U+FE0F). Discord
+#: akzeptiert diese Sequenz bei ``Button.emoji`` klaglos, lehnt sie aber bei
+#: ``SelectOption.emoji`` mit ``400 Invalid Form Body — Invalid emoji`` ab
+#: (bekannte Inkonsistenz der Discord-API, siehe discord-api-docs #5511).
+#: Genau das war die Ursache dafür, dass ``/adminpanel`` in Produktion mit
+#: „Die Anwendung reagiert nicht“ endete, sobald mindestens ein ❗️-Eintrag
+#: (Server ohne Bot-Owner als Mitglied) in der Liste stand — die Server-Suche
+#: nach dem Root-Cause bestätigte per Render-Log exakt diesen Fehler:
+#: ``components.0.components.5.components.0.options.0.emoji.name: Invalid emoji``.
+_VARIATION_SELECTORS = "\ufe0e\ufe0f"
+
+
+def _select_safe_emoji(emoji: str) -> str:
+    """Entfernt Variation-Selectoren aus einem Emoji für ``discord.SelectOption``.
+
+    Nur für Select-Menü-Optionen nötig — Buttons vertragen die volle
+    Emoji-Sequenz inklusive Variation-Selector problemlos.
+    """
+    return emoji.translate({ord(c): None for c in _VARIATION_SELECTORS})
 
 
 def welcome_view() -> discord.ui.LayoutView:
@@ -329,7 +354,11 @@ def admin_panel_view(
                 label=getattr(guild, "name", "Server")[:100],
                 value=str(guild.id),
                 description=desc[:100],
-                emoji="❗️" if not entry["owner_present"] else "🏰",
+                # WICHTIG: hier NUR das VS16-freie Emoji verwenden — siehe
+                # _select_safe_emoji()-Docstring. Der Marker/Legend-Text darf
+                # weiterhin die „hübsche“ Variante mit Variation-Selector
+                # zeigen, denn TextDisplay ist davon nicht betroffen.
+                emoji=_select_safe_emoji("❗️") if not entry["owner_present"] else "🏰",
             )
         )
     if not lines:
@@ -763,12 +792,44 @@ class RelayClient(discord.Client):
             log.debug("Slash-Commands wurden vor %.0f s registriert — Sync übersprungen.",
                       (now - last).total_seconds())
             return
+
+        # ── Diagnostik ───────────────────────────────────────────────────────
+        # Vor dem Sync: das PAYLOAD loggen, das an Discord geht — insbesondere
+        # bei /adminpanel interessieren ``contexts``/``dm_permission``/
+        # ``integration_types`` (Verdacht: könnte von Discord verworfen
+        # werden). Schmales, aber dauerhaftes Logging.
         try:
-            await self.tree.sync()
-        except Exception as exc:  # noqa: BLE001 — HTTPException, RateLimited, Sync-Fehler
-            log.warning("Slash-Command-Sync fehlgeschlagen (%s) — Bot läuft weiter, "
-                        "bereits registrierte Commands bleiben aktiv.", exc)
+            outgoing = [c.to_dict(self.tree) for c in self.tree.get_commands()]
+            log.info("Slash-Command-Sync: sende %d Commands, Payload: %s",
+                      len(outgoing), json.dumps(outgoing, ensure_ascii=False))
+        except Exception:  # noqa: BLE001 — Diagnostik darf den Sync nie verhindern
+            log.exception("Slash-Command-Sync: Payload-Dump vor dem Sync fehlgeschlagen.")
+
+        try:
+            synced = await self.tree.sync()
+        except discord.HTTPException as exc:
+            log.exception(
+                "Slash-Command-Sync fehlgeschlagen — status=%s discord_error_code=%s text=%r. "
+                "Bot läuft weiter, bereits registrierte Commands bleiben aktiv.",
+                getattr(exc, "status", None), getattr(exc, "code", None), getattr(exc, "text", None),
+            )
             return
+        except Exception as exc:  # noqa: BLE001 — RateLimited & Co. sollen den Bot nicht crashen
+            log.exception(
+                "Slash-Command-Sync fehlgeschlagen (%s) — Bot läuft weiter, "
+                "bereits registrierte Commands bleiben aktiv.", exc,
+            )
+            return
+
+        # Nach dem Sync: das, was Discord TATSÄCHLICH zurückgegeben hat —
+        # zeigt z. B., ob contexts/dm_permission/integration_types vom
+        # Server anders interpretiert oder stillschweigend genullt wurden.
+        try:
+            log.info("Slash-Command-Sync: Discord bestätigt %d Commands: %s",
+                      len(synced), json.dumps([c.to_dict() for c in synced], ensure_ascii=False))
+        except Exception:
+            log.exception("Slash-Command-Sync: Payload-Dump nach dem Sync fehlgeschlagen.")
+
         if self.state is not None:
             self.state.commands_synced_at = now
         log.info("Slash-Commands global registriert (Sync kann bis zu 1 Stunde dauern; "
@@ -1328,12 +1389,79 @@ class RelayClient(discord.Client):
 
             # Das Sammeln der Serverdaten kann (ohne privilegierte Intents)
             # ein paar REST-Aufrufe kosten — erst deferigen, dann liefern.
-            await interaction.response.defer()
-            view = await self._admin_panel_view(page=0, query="")
+            #
+            # ── Diagnostik ──────────────────────────────────────────────────
+            # Zeitlich befristeter, aber bewusst dauerhaft belassener
+            # Debug-Block (schmales Logging): defer() und followup.send()
+            # werden EINZELN mit perf_counter gemessen und JEDE Exception
+            # (nicht nur HTTPException!) wird mit vollem Traceback geloggt —
+            # inklusive HTTP-Status/Code/Body bei discord.HTTPException. Das
+            # hat den echten Bug hier gefunden: ein `SelectOption.emoji` mit
+            # Variation-Selector (❗️) ließ Discord die followup.send()-Antwort
+            # mit 400 „Invalid emoji“ ablehnen — ohne diesen Block sah man nur
+            # den generischen discord.HTTPException-Text, aber weder Status
+            # noch Feld-Pfad.
+            t0 = time.perf_counter()
+            defer_ok = False
+            try:
+                await interaction.response.defer()
+                defer_ok = True
+            except Exception as exc:  # noqa: BLE001 — wir wollen ALLES sehen
+                log.exception(
+                    "adminpanel: defer() fehlgeschlagen nach %.3fs — app_id=%s data=%r (%s)",
+                    time.perf_counter() - t0, getattr(interaction, "application_id", None),
+                    getattr(interaction, "data", None), type(exc).__name__,
+                )
+                return
+            log.info("adminpanel: defer() OK nach %.3fs (app_id=%s)",
+                      time.perf_counter() - t0, getattr(interaction, "application_id", None))
+
+            t1 = time.perf_counter()
+            try:
+                view = await self._admin_panel_view(page=0, query="")
+            except Exception:
+                log.exception(
+                    "adminpanel: Server-Liste konnte nicht gebaut werden (defer_ok=%s, %.3fs)",
+                    defer_ok, time.perf_counter() - t1,
+                )
+                await self._deny(
+                    interaction, "Adminpanel-Fehler",
+                    "Die Server-Liste konnte nicht gebaut werden. Details stehen im Render-Log.",
+                )
+                return
+
+            t2 = time.perf_counter()
             try:
                 await interaction.followup.send(view=view)
+                log.info("adminpanel: followup.send() OK nach %.3fs (defer+build+send=%.3fs)",
+                          time.perf_counter() - t2, time.perf_counter() - t0)
             except discord.HTTPException as exc:
-                log.error("Adminpanel konnte nicht gesendet werden: %s", exc)
+                # Nicht nur den String loggen — Klasse, HTTP-Status, Discord-
+                # Fehlercode UND den Body zeigen genau, WELCHES Feld Discord
+                # abgelehnt hat (z. B. ``options.0.emoji.name``).
+                log.exception(
+                    "adminpanel: followup.send() fehlgeschlagen nach %.3fs — "
+                    "status=%s discord_error_code=%s text=%r app_id=%s",
+                    time.perf_counter() - t2, getattr(exc, "status", None),
+                    getattr(exc, "code", None), getattr(exc, "text", None),
+                    getattr(interaction, "application_id", None),
+                )
+                # Der Owner soll trotzdem etwas sehen statt endlos auf
+                # „Bot denkt nach…“ zu warten — der Interaction-Token lebt
+                # nach dem defer() noch 15 Minuten, ein zweiter followup mit
+                # einer einfachen Fehlermeldung (ohne den kaputten View) geht
+                # praktisch immer durch.
+                try:
+                    await interaction.followup.send(
+                        content="⛔ Adminpanel konnte nicht gesendet werden — Details im Render-Log.",
+                    )
+                except discord.HTTPException:
+                    log.exception("adminpanel: auch die Fehlermeldung als followup schlug fehl.")
+            except Exception:  # noqa: BLE001 — auch nicht-HTTP-Fehler sichtbar machen
+                log.exception(
+                    "adminpanel: followup.send() mit UNERWARTETER Exception nach %.3fs (app_id=%s)",
+                    time.perf_counter() - t2, getattr(interaction, "application_id", None),
+                )
 
         # Hinweis: pro-Command on_error ist hier NICHT nötig — discord.py ruft
         # bei einem Fehler SOWOHL command.on_error ALS AUCH tree.on_error auf

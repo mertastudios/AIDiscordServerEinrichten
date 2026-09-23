@@ -1199,6 +1199,28 @@ def _bad_section_accessories(view: Any) -> List[Any]:
     return bad
 
 
+def _bad_select_option_emojis(view: Any) -> List[str]:
+    """
+    Discord lehnt Variation-Selector-16 (U+FE0F) in ``SelectOption.emoji`` mit
+    400 "Invalid emoji" ab, obwohl dieselbe Emoji-Sequenz bei Buttons klaglos
+    durchgeht (bekannte Inkonsistenz der Discord-API). Genau das brach
+    /adminpanel in Produktion: sobald mindestens ein Server ohne
+    Bot-Owner-Mitgliedschaft (❗️-Marker) in der Liste stand, lehnte Discord
+    followup.send() mit ``options.0.emoji.name: Invalid emoji`` ab — im
+    Client sichtbar als endloses "Bot denkt nach..." gefolgt von
+    "Die Anwendung reagiert nicht".
+    """
+    bad: List[str] = []
+    for part in _flatten_view(view):
+        if part.get("type") == 3:  # Select-Menü
+            for option in part.get("options", []):
+                emoji = option.get("emoji") or {}
+                name = emoji.get("name")
+                if name and ("\ufe0f" in name or "\ufe0e" in name):
+                    bad.append(name)
+    return bad
+
+
 async def test_owner_features() -> None:
     print("\n── Unit: Owner-Features (Presence / Adminpanel / DMs) ───────")
     cfg = load_config()
@@ -1355,6 +1377,9 @@ async def test_owner_features() -> None:
     panel = owner_it.followup.sends[0]["view"] if owner_it.followup.sends else None
     panel_text = _view_text(panel) if panel is not None else ""
     check("Panel ist Container V2", panel is not None and panel.has_components_v2())
+    check("Panel (❗️-Server dabei): Select-Option-Emoji ohne Variation-Selector",
+          panel is not None and _bad_select_option_emojis(panel) == [],
+          str([n.encode("unicode_escape") for n in _bad_select_option_emojis(panel)]) if panel is not None else "kein Panel")
     check("Panel hat einen Schließen-Button",
           any(b.get("label") == "Schließen" and "close" in b.get("custom_id", "")
               for b in _view_buttons(panel)),
