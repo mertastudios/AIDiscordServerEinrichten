@@ -32,8 +32,8 @@ Die Buttons sind persistent (``timeout=None`` + Registrierung in
 Der Prompt darin ist bewusst ein **einzeiliger** Codeblock — Discord-Mobile
 kopiert einzeilige Codeboxen mit einem einzigen Tipp, mehrzeilige nicht.
 
-Dazu kommen zwei Sicherheits-Commands: ``/status`` (Rechte-Check) und
-``/revoke`` (Zugriff sofort entziehen).
+Der Zugriff wird direkt in ``/connect`` über die Buttons verwaltet; separate
+``/status``- und ``/revoke``-Commands gibt es nicht.
 
 **Owner-Features** (``BOT_OWNER_ID``): Die Presence zeigt live
 ``/connect | 👀 N eingerichtete Server``. Im Privatchat mit dem Bot gibt es
@@ -57,7 +57,7 @@ from discord import app_commands
 from . import __version__
 from .config import Config, mask_proxy_url
 from .sessions import DEFAULT_MODE, SessionStore
-from .util import ApiError, human_duration, now_utc
+from .util import ApiError, now_utc
 
 log = logging.getLogger("relay.discord")
 
@@ -135,14 +135,17 @@ def build_intents(privileged: bool = True) -> discord.Intents:
 
 def _bridge_prompt_line(base_url: str, token: str) -> str:
     """
-    Der Mini-Prompt für Arena AI: **nur** URL und Token — in **einer** Zeile.
+    Der Mini-Prompt für Arena AI: **nur** URL und Token — ohne Leerzeichen.
+
+    Das maschinenlesbare ``URL=…;TOKEN=…``-Format ist trotz seiner Kompaktheit
+    eindeutig und lässt sich von Arena zuverlässig auswerten.
 
     Der komplette Regel- und Workflow-Katalog (Hygiene, Personas, Branding,
     Unicode-Design …) muss der Nutzer nicht mehr kopieren — die Bridge erklärt
     sich Arena AI selbst, sobald diese arbeitet: ``GET /api/v1/capabilities``
     liefert Konventionen und Endpoints, dazu die ``/api/v1/guides/*``-Texte.
     """
-    return f"URL: {base_url} | TOKEN: {token}"
+    return f"URL={base_url};TOKEN={token}"
 
 
 def welcome_view() -> discord.ui.LayoutView:
@@ -351,6 +354,10 @@ def admin_panel_view(
             label="Weiter", emoji="▶️", style=discord.ButtonStyle.secondary,
             custom_id=_admin_custom_id("nav", page + 1, query), disabled=page >= pages - 1,
         ),
+        discord.ui.Button(
+            label="Schließen", emoji="✖️", style=discord.ButtonStyle.danger,
+            custom_id=_admin_custom_id("close", page, query),
+        ),
     ]
     if query:
         buttons.append(discord.ui.Button(
@@ -481,6 +488,10 @@ def admin_guild_detail_view(
             label="Server verlassen", emoji="🚪", style=discord.ButtonStyle.danger,
             custom_id=_admin_guild_custom_id("leave", guild.id, page, query),
         ),
+        discord.ui.Button(
+            label="Schließen", emoji="✖️", style=discord.ButtonStyle.secondary,
+            custom_id=_admin_custom_id("close", page, query),
+        ),
     ]
 
     components.extend([
@@ -520,6 +531,10 @@ def admin_guild_leave_confirm_view(
             discord.ui.Button(
                 label="Ja, Server verlassen", emoji="🚪", style=discord.ButtonStyle.danger,
                 custom_id=_admin_guild_custom_id("leave_confirm", guild.id, page, query),
+            ),
+            discord.ui.Button(
+                label="Schließen", emoji="✖️", style=discord.ButtonStyle.secondary,
+                custom_id=_admin_custom_id("close", page, query),
             ),
         ),
         accent_colour=ERR_COLOR,
@@ -1085,6 +1100,20 @@ class RelayClient(discord.Client):
         page = parsed.get("page", 0)
         query = parsed.get("query", "")
 
+        if action == "close":
+            # Das Panel ist eine normale DM. Erst den Klick bestätigen, dann
+            # die Panel-Nachricht vollständig entfernen.
+            try:
+                await interaction.response.defer()
+                message = getattr(interaction, "message", None)
+                if message is not None:
+                    await message.delete()
+                else:
+                    await interaction.delete_original_response()
+            except (discord.HTTPException, discord.NotFound, discord.InteractionResponded) as exc:
+                log.warning("Adminpanel konnte nicht geschlossen werden: %s", exc)
+            return
+
         if action == "search":
             await interaction.response.send_modal(AdminSearchModal(self))
             return
@@ -1266,119 +1295,10 @@ class RelayClient(discord.Client):
                 )
 
         @self.tree.command(
-            name="status",
-            description="🩺 Rechte-Check: Bot, Server, aktive KI-Zugriffe",
-        )
-        @app_commands.guild_only()
-        async def status(interaction: discord.Interaction) -> None:
-            gate = await self._guard(interaction, require_bot_admin=False)
-            if gate is None:
-                return
-            guild = gate["guild"]
-            me = guild.me
-            perms = me.guild_permissions if me else discord.Permissions.none()
-            sessions = self.store.active_for_guild(guild.id)
-            base = self.state.base_url()
-
-            embed = discord.Embed(
-                title=f"🩺 {self.config.bot_name} · Status",
-                color=OK_COLOR if perms.administrator else WARN_COLOR,
-                timestamp=now_utc(),
-            )
-            embed.add_field(
-                name="🤖 Bot",
-                value=f"{self.user.name if self.user else '?'} · `{self.user.id if self.user else '?'}`\n"
-                      f"Version {__version__} · discord.py {discord.__version__}",
-                inline=False,
-            )
-            embed.add_field(
-                name="🔑 Administrator",
-                value="✅ Ja — alles möglich" if perms.administrator
-                      else "❌ **Nein** — bitte Bot-Rolle auf Administrator setzen",
-                inline=True,
-            )
-            embed.add_field(
-                name="🛡️ Fehlende Rechte",
-                value="keine" if perms.administrator else _missing_permissions_text(perms),
-                inline=True,
-            )
-            embed.add_field(
-                name="🌐 Öffentliche URL",
-                value=f"[{base}]({base})",
-                inline=False,
-            )
-            embed.add_field(
-                name="🔗 Aktive KI-Zugriffe",
-                value=_sessions_text(sessions) or "keine",
-                inline=False,
-            )
-            embed.add_field(
-                name="📊 Betrieb",
-                value=f"Uptime {human_duration(self.state.uptime_seconds())} · "
-                      f"{self.state.request_count} API-Aufrufe · "
-                      f"{self.state.error_count} Fehler · Gateway "
-                      f"{round(self.latency * 1000)} ms",
-                inline=False,
-            )
-            if self.admin_invite_url():
-                embed.add_field(
-                    name="➕ Bot neu einladen (mit Administrator)",
-                    value=self.admin_invite_url(),
-                    inline=False,
-                )
-            warn = self._base_url_warning()
-            if warn:
-                embed.add_field(name="⚠️ Hinweis", value=warn[:1020], inline=False)
-            embed.set_footer(text="AIDiscordServerEinrichten · Relay für Arena AI")
-
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-
-        @self.tree.command(
-            name="revoke",
-            description="⛔ Alle aktiven KI-Zugriffe (Tokens) für diesen Server widerrufen",
-        )
-        @app_commands.guild_only()
-        async def revoke(interaction: discord.Interaction) -> None:
-            gate = await self._guard(interaction, require_bot_admin=False)
-            if gate is None:
-                return
-            guild = gate["guild"]
-            member = gate["member"]
-            sessions = self.store.active_for_guild(guild.id)
-            if not sessions:
-                await interaction.response.send_message(
-                    embed=discord.Embed(
-                        description="ℹ️ Es gibt gerade keine aktiven KI-Zugriffe auf diesem Server.",
-                        color=OK_COLOR,
-                    ),
-                    ephemeral=True,
-                )
-                return
-            revoked = await self.store.revoke(guild_id=guild.id, by=f"discord:{member.id}")
-            self.state.maybe_save(force=True)
-            embed = discord.Embed(
-                title="⛔ Zugriff widerrufen",
-                description=(
-                    f"**{len(revoked)} Token** sofort deaktiviert. Arena AI hat damit "
-                    "keinen Zugriff mehr auf diesen Server."
-                ),
-                color=ERR_COLOR,
-                timestamp=now_utc(),
-            )
-            embed.add_field(
-                name="Betroffene Sitzungen",
-                value=_sessions_text(sessions),
-                inline=False,
-            )
-            embed.set_footer(text=f"Ausgeführt von {member.display_name}")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            log.info("%s hat %d Sitzung(en) auf '%s' widerrufen.", member.display_name,
-                     len(revoked), guild.name)
-
-        @self.tree.command(
             name="adminpanel",
             description="🛠️ Server-Übersicht für den Bot-Owner (nur im Privatchat)",
         )
+        @app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
         async def adminpanel(interaction: discord.Interaction) -> None:
             """Das Adminpanel: Server-Liste mit Suche und Blättern — Owner-only."""
             if interaction.guild is not None:
@@ -1621,33 +1541,3 @@ class RelayClient(discord.Client):
             "Details stehen im Render-Log.",
             color=ERR_COLOR,
         )
-
-
-def _missing_permissions_text(perms: discord.Permissions) -> str:
-    needed = [
-        "manage_guild", "manage_channels", "manage_roles", "manage_webhooks",
-        "manage_expressions", "manage_events", "kick_members", "ban_members",
-        "moderate_members", "manage_messages", "view_audit_log", "manage_threads",
-        "move_members", "mute_members", "deafen_members", "request_to_speak",
-    ]
-    missing = [name for name in needed if not getattr(perms, name, False)]
-    if not missing:
-        return "keine"
-    text = ", ".join(f"`{m}`" for m in missing)
-    return text[:900] + (" …" if len(text) > 900 else "")
-
-
-def _sessions_text(sessions: List[Any]) -> str:
-    if not sessions:
-        return ""
-    lines: List[str] = []
-    for session in sessions[-8:]:
-        info = session.to_public_dict()
-        lines.append(
-            f"• `{session.token_prefix}` · {info['mode_label']} · von "
-            f"{info['created_by_name']} · {info['expires_in']} · "
-            f"{info['request_count']} Aufrufe"
-        )
-    if len(sessions) > 8:
-        lines.append(f"… und {len(sessions) - 8} weitere")
-    return "\n".join(lines)[:1000]

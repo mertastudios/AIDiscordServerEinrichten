@@ -321,12 +321,7 @@ aufrufst, während bereits eine Verbindung besteht):
 > Du kannst sofort mit Arena AI losarbeiten.
 > ─────────────
 > **1. Kopiere diesen Prompt:**
-> ```
-> Discord-Bridge für Arena AI
-> URL: https://dein-relay.onrender.com
-> TOKEN: adse_…
-> Start: GET …/api/v1/capabilities mit Header "Authorization: Bearer TOKEN"
-> ```
+> `URL=https://dein-relay.onrender.com;TOKEN=adse_…`
 > ─────────────
 > **2. Öffne Arena AI, schreib ihm was er auf deinem Server einrichten soll
 > und schick ihm den Prompt:**
@@ -335,9 +330,10 @@ aufrufst, während bereits eine Verbindung besteht):
 > **Weitere Optionen:**
 > **[⛔ Verbindung trennen]** *(rot)* **[🔄 Neues Token generieren]**
 
-Der Prompt ist bewusst **minimal** — nur URL und Token: Alles Weitere (Regeln,
-Workflow, Konventionen, Vorlagen) erzählt die Bridge Arena AI **während der
-Arbeit** selbst über `GET /api/v1/capabilities` und die `/guides`-Endpoints.
+Der Prompt ist bewusst **minimal und frei von Leerzeichen** — das eindeutige
+`URL=…;TOKEN=…`-Format ist für Arena gut lesbar und auf Mobilgeräten mit einem
+Tipp kopierbar. Alles Weitere (Regeln, Workflow, Konventionen, Vorlagen)
+erzählt die Bridge Arena AI **während der Arbeit** selbst über `GET /api/v1/capabilities` und die `/guides`-Endpoints.
 Die Buttons sind persistent (funktionieren auch nach einem Render-Deploy noch):
 
 | Button | Wirkung |
@@ -346,13 +342,6 @@ Die Buttons sind persistent (funktionieren auch nach einem Render-Deploy noch):
 | 🤖 **Arena AI öffnen** | Link-Button direkt zum Arena-Agenten. |
 | ⛔ **Verbindung trennen** | Widerruft **alle** Tokens dieses Servers sofort; die Nachricht springt zurück in Zustand 1. |
 | 🔄 **Neues Token generieren** | Macht die alten Tokens sofort ungültig und zeigt den Prompt mit dem frischen Token. |
-
-**Zwei Command-Brüder für den Notfall:**
-
-| Command | Zweck |
-| ------- | ----- |
-| `/status` | Rechte-Check: Ist der Bot Administrator? Was fehlt? Wie viele Tokens sind aktiv? |
-| `/revoke` | Entzieht **sofort** allen aktiven KI-Zugriffen auf diesem Server die Gültigkeit |
 
 **Beide Prüfungen, beide Richtungen.** `/connect` (und jeder Button) verweigert sich, wenn
 
@@ -385,14 +374,17 @@ Bei jedem Server-Beitritt und -Verlassen aktualisiert sich die Zahl sofort
 ### `/adminpanel` — die Server-Liste & Serverdetailansicht im Privatchat
 
 Nur für den Bot-Besitzer (`BOT_OWNER_ID`), und nur im **Privatchat mit dem
-Bot** — in Server-Channels verweigert sich der Command. Die Liste zeigt:
+Bot**. Discord registriert den Command ausschließlich für Bot-DMs, nicht in
+Server-Channels oder Gruppen-DMs; zusätzlich prüft jeder Aufruf und Button-Klick
+die Owner-ID. Die Liste zeigt:
 
 - **Sortiert nach Mitgliederzahl, abwärts** — die größten Server zuerst.
 - **Höchste Priorität:** Server, auf denen der Bot-Owner **noch nicht
   Mitglied** ist, stehen ganz oben und tragen ein ❗️ — genau die Server, bei
   denen ein Blick lohnt.
-- **Pagination** (◀️ Zurück / ▶️ Weiter, 10 pro Seite) und **Suche** 🔍
-  (öffnet ein Eingabefenster, filtert auf Teiltreffer im Servernamen).
+- **Pagination** (◀️ Zurück / ▶️ Weiter, 10 pro Seite), **Suche** 🔍
+  (öffnet ein Eingabefenster, filtert auf Teiltreffer im Servernamen) und ein
+  **Schließen-Button** ✖️, der die Panel-DM wieder entfernt.
 - **Serverauswahl per Dropdown** (Select-Menü der aktuellen Seite): Öffnet
   sofort die **Server-Übersicht**.
 
@@ -443,7 +435,7 @@ schicken. Dauert keine zwei Minuten, dann arbeitet Arena AI auf dem Server.
 | **Token sind server-gebunden** | Ein Token für Server A funktioniert auf Server B nicht (`409 GUILD_UNAVAILABLE`). |
 | **Token laufen ab** | Standard 24 h, konfigurierbar. `ttl_hours=0` für unbegrenzt ist bewusst möglich, aber nicht empfohlen. |
 | **Inaktivitäts-Stopp** | War ein Token 24 h verfügbar, wurde aber 24 h lang nicht benutzt, stoppt die Bridge die Verbindung automatisch (`SESSION_INACTIVITY_HOURS`, `0` = aus). Arena AI bekommt beim nächsten Aufruf einen 401er mit Anleitung zum schnellen Wiederanbinden. |
-| **Sofortiger Widerruf** | `/revoke`, der `⛔`-Button, die Console oder `DELETE /api/v1/session`. |
+| **Sofortiger Widerruf** | Der `⛔ Verbindung trennen`-Button in `/connect`, die Console oder `DELETE /api/v1/session`. |
 | **Sitzungs-Limit** | Maximal 5 aktive Tokens pro Server; das älteste wird automatisch widerrufen. |
 | **Berechtigungs-Stufen** | `read` · `write` · `manage` · `danger` — jeder Endpoint hat einen Minimal-Scope. |
 | **Rate-Limiting** | 240 Anfragen pro Token und Minute, sliding window. Bei `429` kommt `retry_after`. |
@@ -456,7 +448,7 @@ schicken. Dauert keine zwei Minuten, dann arbeitet Arena AI auf dem Server.
 > hat die KI Administrator-Macht über deinen Server — genau das ist der Zweck.
 > Sie kann Kanäle löschen, Mitglieder bannen und Einstellungen ändern. Nutze
 > 👁️ **Nur lesen**, wenn du erst zuschauen willst, und entzieh den Zugriff mit
-> `/revoke`, sobald du fertig bist.
+> **Verbindung trennen** in `/connect`, sobald du fertig bist.
 
 ---
 
@@ -806,7 +798,7 @@ die Discord-Antworten — läuft also in Millisekunden, ohne Netzwerk und ohne T
 | IP frei, Login trotzdem 429 | Token-Problem: lange warten, **kein** Container-Neustart |
 | Discord-429 mit `Via`-Header | `Retry-After` wird gedeckelt — nie wieder 1800 s blind schlafen |
 | HTTP 5xx mehrfach | Backoff eskaliert (der Fehlerzähler verfällt nicht mehr) |
-| Client-Setup (echter `RelayClient`, kein Fake) | `setup_hook()` registriert 3 Commands + 1 persistente View; Button-Klicks (`relay:regenerate` / `relay:revoke_all`) erreichen ihre Handler; keine Bot-only-API in der Quelle |
+| Client-Setup (echter `RelayClient`, kein Fake) | `setup_hook()` registriert 2 Commands + 1 persistente View; Button-Klicks (`relay:regenerate` / `relay:revoke_all`) erreichen ihre Handler; keine Bot-only-API in der Quelle |
 
 Der GitHub-Actions-Workflow liegt in [`ci/ci.yml`](ci/ci.yml) und prüft bei jedem
 Push und Pull Request Python **3.11 und 3.12**, baut zusätzlich das Docker-Image
@@ -835,7 +827,7 @@ unter `version`, ob das Deploy die gefixte Version enthält (`1.0.1` oder neuer)
 **`/connect` erscheint nicht im Discord-Menü**
 Slash-Commands brauchen nach der Registrierung bis zu einer Stunde. Prüfe im
 Render-Log `Slash-Commands global registriert`. Falls der Bot nicht auf dem
-Server ist: neu einladen (der Invite-Link steht in `/status`).
+Server ist: neu über den OAuth2-Link aus dem Discord Developer Portal einladen.
 
 **`⛔ Der Bot braucht Administrator-Rechte`**
 Servereinstellungen → Rollen → Bot-Rolle → *Administrator* aktivieren **und die
@@ -982,7 +974,7 @@ AIDiscordServerEinrichten/
 ├── bot/
 │   ├── main.py              Einstiegspunkt: Bot + Web-Server in einem Loop
 │   ├── __main__.py          python -m bot
-│   ├── discord_bot.py       /connect, /status, /revoke, /adminpanel, Container-V2-Buttons, Presence, Owner-DMs
+│   ├── discord_bot.py       /connect, privates /adminpanel, Container-V2-Buttons, Presence, Owner-DMs
 │   ├── config.py            Umgebungsvariablen, Validierung, maskierte Ausgabe
 │   ├── netcheck.py          Netz-Diagnose: ausgehende IP + discord.com-Probe
 │   ├── restarts.py          Neustart-Buch: Zyklen + gesehene IPs über Prozessgrenzen
@@ -1041,5 +1033,5 @@ AIDiscordServerEinrichten/
 
 **Kurz gesagt:** Dieses Projekt gibt einer KI Administrator-Rechte über deinen
 Discord-Server. Lies den Abschnitt [Sicherheitsmodell](#sicherheitsmodell), bevor
-du es auf einem Server einsetzt, der dir wichtig ist — und nutze `/revoke`, wenn
-du fertig bist.
+du es auf einem Server einsetzt, der dir wichtig ist — und trenne die Verbindung,
+wenn du fertig bist.

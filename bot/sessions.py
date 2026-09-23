@@ -13,7 +13,7 @@ Stattdessen erzeugt der **Verbinden**-Button aus ``/connect`` ein
 * nur für genau einen Server gilt (``guild_id``),
 * einen Ablaufzeitpunkt hat (TTL),
 * genau zwei Modi kennt: **Lesen + Schreiben** oder **Nur lesen**,
-* jederzeit per Button, ``/revoke`` oder API widerrufbar ist,
+* jederzeit per „Verbindung trennen“-Button oder API widerrufbar ist,
 * automatisch gestoppt wird, wenn es **24 Stunden lang nicht benutzt** wurde
   (:meth:`SessionStore.revoke_inactive` — ein verfügbares, aber ungenutztes
   Token ist ein unnötig offenes Tor), und
@@ -539,7 +539,7 @@ class SessionStore:
                 "schnell wieder aufbaut. Wahrscheinliche Ursachen:\n"
                 "• Er hat ein **neues Token generiert** — damit wurde das alte sofort ungültig.\n"
                 "• Er hat die **Verbindung getrennt oder das Token zurückgesetzt** "
-                "(„Verbindung trennen“, /revoke oder die API).\n"
+                "(„Verbindung trennen“ oder die API).\n"
                 "• Es wurde **zu lange nichts gemacht**: Wird ein Token 24 Stunden lang nicht "
                 "benutzt, stoppt die Bridge die Verbindung automatisch.\n"
                 "• Oder der Bot wurde neu gestartet und verliert dabei Tokens auf flüchtigem "
