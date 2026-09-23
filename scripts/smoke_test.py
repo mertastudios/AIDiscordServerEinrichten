@@ -848,7 +848,8 @@ async def t_prompt(h: Harness) -> None:
     )
     p_line = _bridge_prompt_line("https://relay.example.com", "adse_smoke123")
     check("Bridge-Prompt-Line: nur URL und Token",
-          p_line == "URL: https://relay.example.com | TOKEN: adse_smoke123")
+          p_line == "URL=https://relay.example.com;TOKEN=adse_smoke123"
+          and " " not in p_line)
     cv = connected_view("https://relay.example.com", "adse_smoke123")
     check("connected_view ist LayoutView (Components V2)", cv.has_components_v2())
     check("ARENA_URL zeigt auf Agent-Endpoint", ARENA_URL == "https://arena.ai/agent")

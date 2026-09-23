@@ -953,8 +953,16 @@ async def test_client_setup() -> None:
     check("setup_hook() wirft nicht", setup_ok, setup_detail)
 
     names = {c.name for c in client.tree.get_commands()}
-    check("vier Slash-Commands registriert (inkl. adminpanel)",
-          names == {"connect", "status", "revoke", "adminpanel"}, str(sorted(names)))
+    check("nur connect und adminpanel sind registriert",
+          names == {"connect", "adminpanel"}, str(sorted(names)))
+    panel_command = client.tree.get_command("adminpanel")
+    panel_contexts = getattr(panel_command, "allowed_contexts", None)
+    check("adminpanel ist ausschließlich im privaten Bot-DM registriert",
+          panel_contexts is not None
+          and panel_contexts.guild is False
+          and panel_contexts.dm_channel is True
+          and panel_contexts.private_channel is False,
+          str(panel_contexts))
     check("genau eine persistente Button-View",
           len(client.persistent_views) == 1, str(len(client.persistent_views)))
     check("Command-Sync wurde aufgerufen", len(sync_calls) == 1)
@@ -995,13 +1003,14 @@ async def test_client_setup() -> None:
           linked.has_components_v2() and linked.to_components()[0]["type"] == 17)
     linked_text = _texts(linked)
     check("Verbunden: Prompt-Block enthält nur Verbindung",
-          "URL: https://relay.example.com" in linked_text
-          and "TOKEN: adse_UNITTEST" in linked_text
+          "URL=https://relay.example.com" in linked_text
+          and "TOKEN=adse_UNITTEST" in linked_text
           and "REGELN:" not in linked_text
           and "/api/v1/capabilities" not in linked_text, linked_text[:200])
     linked_codeblocks = re.findall(r"`([^`\n]+)`", linked_text)
     check("Verbunden: Prompt ist EIN einzeiliger Codeblock (Mobile-Tap-Copy)",
-          any(cb == "URL: https://relay.example.com | TOKEN: adse_UNITTEST" for cb in linked_codeblocks),
+          any(cb == "URL=https://relay.example.com;TOKEN=adse_UNITTEST" for cb in linked_codeblocks)
+          and all(" " not in cb for cb in linked_codeblocks),
           str(linked_codeblocks))
     check("Verbunden: Arena-Link + roter Trennen + Neues Token",
           any(b.get("url") == "https://arena.ai/agent" for b in _buttons(linked))
@@ -1323,6 +1332,10 @@ async def test_owner_features() -> None:
     panel = owner_it.followup.sends[0]["view"] if owner_it.followup.sends else None
     panel_text = _view_text(panel) if panel is not None else ""
     check("Panel ist Container V2", panel is not None and panel.has_components_v2())
+    check("Panel hat einen Schließen-Button",
+          any(b.get("label") == "Schließen" and "close" in b.get("custom_id", "")
+              for b in _view_buttons(panel)),
+          str([b.get("label") for b in _view_buttons(panel)]))
     check("Panel: ❗️-Server (Owner fehlt) stehen ganz oben — nach Mitgliedern sortiert",
           panel_text.find("❗️ **Alpha**") < panel_text.find("❗️ **Tiny**")
           < panel_text.find("**Mid**") < panel_text.find("**Zeta**"),
@@ -1355,6 +1368,19 @@ async def test_owner_features() -> None:
           len(search_it.response.modals) == 1
           and search_it.response.modals[0].title == "🔍 Server suchen",
           str([getattr(m, "title", "?") for m in search_it.response.modals]))
+
+    # Schließen-Button bestätigt den Klick und löscht die Panel-DM.
+    class _DeletableMessage:
+        deleted = False
+
+        async def delete(self) -> None:
+            self.deleted = True
+
+    close_it = _panel_interaction(cfg.bot_owner_id)
+    close_it.message = _DeletableMessage()
+    await client._handle_admin_button(close_it, "relay:admin:close:0:")
+    check("Schließen-Button entfernt das Adminpanel",
+          close_it.response.deferred and close_it.message.deleted)
 
     # Modal-Submit: Filter greift, Liste startet bei Seite 1.
     modal = search_it.response.modals[0]
